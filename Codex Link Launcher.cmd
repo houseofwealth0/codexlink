@@ -25,5 +25,11 @@ echo Two visible windows should now be open:
 echo   - Codex Link Controller
 echo   - Codex Link ngrok Tunnel
 echo.
-echo Wait a few seconds, then open http://localhost:8787/
+echo Opening dashboard automatically...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 4; Start-Process 'http://localhost:8787/'"
+echo Dashboard:
+echo   http://localhost:8787/
+echo.
+echo Control center:
+echo   %ROOT%control-center
 pause

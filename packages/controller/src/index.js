@@ -1,5 +1,6 @@
 const http = require("http");
 const path = require("path");
+const { execFile } = require("child_process");
 const { Store } = require("./store");
 const { startTelegramBot } = require("./telegram");
 const { createSetupPlan, actionsForMode } = require("../../shared/src/setup-agent");
@@ -20,6 +21,62 @@ function externalBaseUrl(req) {
     return `https://${host}`;
   }
   return BASE_URL;
+}
+
+function isLocalRequest(req) {
+  const remote = req.socket.remoteAddress;
+  const host = req.headers.host || "";
+  return remote === "127.0.0.1"
+    || remote === "::1"
+    || remote === "::ffff:127.0.0.1"
+    || host.startsWith("localhost:")
+    || host.startsWith("127.0.0.1:");
+}
+
+function getJson(url, timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const request = http.get(url, { timeout: timeoutMs }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 200_000) request.destroy();
+      });
+      response.on("end", () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    request.on("timeout", () => {
+      request.destroy();
+      resolve(null);
+    });
+    request.on("error", () => resolve(null));
+  });
+}
+
+async function detectNgrokUrl() {
+  const tunnels = await getJson("http://127.0.0.1:4040/api/tunnels");
+  const tunnel = tunnels?.tunnels?.find((candidate) => candidate.proto === "https" && candidate.public_url);
+  return tunnel?.public_url || null;
+}
+
+async function installBaseUrl(req) {
+  const requestBase = externalBaseUrl(req);
+  if (requestBase !== BASE_URL) return requestBase;
+  return await detectNgrokUrl() || BASE_URL;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function sendJson(res, status, payload) {
@@ -57,12 +114,29 @@ function authenticate(req) {
   return store.authenticateApp(appId, token);
 }
 
-function htmlPage() {
+function stopNgrok() {
+  if (process.platform !== "win32") return Promise.resolve();
+  return new Promise((resolve) => {
+    execFile("taskkill.exe", ["/IM", "ngrok.exe", "/F"], (error) => {
+      resolve({ ok: !error, error: error?.message || null });
+    });
+  });
+}
+
+async function htmlPage(req) {
   const apps = store.listApps();
   const tasks = store.listTasks();
   const logs = store.data.logs.slice(0, 30);
   const plans = Object.values(store.data.setupPlans).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const onlineCutoff = Date.now() - 90_000;
+  const ngrokUrl = await detectNgrokUrl();
+  const publicInstallUrl = await installBaseUrl(req);
+  const installCommand = ngrokUrl
+    ? `npx github:houseofwealth0/codexlink install --controller ${ngrokUrl} --pairing-code YOUR_CODE`
+    : "ngrok tunnel not detected. Start Codex Link Launcher, then refresh this dashboard to get the Replit install command.";
+  const ngrokStatus = ngrokUrl
+    ? `<p><span class="pill online">ngrok online</span> <code>${escapeHtml(ngrokUrl)}</code></p>`
+    : `<p><span class="pill offline">ngrok not detected</span> Start Codex Link Launcher or the ngrok window, then refresh.</p>`;
 
   return `<!doctype html>
 <html>
@@ -74,12 +148,14 @@ function htmlPage() {
     :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; background: #f7f8fb; color: #1b1f2a; }
     header { padding: 24px; border-bottom: 1px solid #dfe3ea; background: #ffffff; }
+    .header-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
     h1 { margin: 0; font-size: 24px; }
     main { max-width: 1180px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
     section { background: #fff; border: 1px solid #dfe3ea; border-radius: 8px; padding: 18px; }
     h2 { margin: 0 0 12px; font-size: 16px; }
     form { display: inline; }
     button { border: 0; border-radius: 6px; background: #1f6feb; color: white; padding: 9px 12px; cursor: pointer; font-weight: 600; }
+    .danger { background: #b42318; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
     th, td { padding: 10px 8px; border-bottom: 1px solid #edf0f5; text-align: left; vertical-align: top; }
     code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
@@ -97,17 +173,25 @@ function htmlPage() {
 </head>
 <body>
   <header>
-    <h1>Codex Link</h1>
-    <p>Controller: <code>${BASE_URL}</code></p>
+    <div class="header-row">
+      <div>
+        <h1>Codex Link</h1>
+        <p>Controller: <code>${BASE_URL}</code></p>
+      </div>
+      <form method="post" action="/shutdown" onsubmit="return confirm('Shut down Codex Link controller and ngrok?');">
+        <button class="danger" type="submit">Shut Down Codex Link</button>
+      </form>
+    </div>
   </header>
   <main>
     <section>
       <h2>Pair A Replit App</h2>
+      ${ngrokStatus}
       <form method="post" action="/pairing-code">
         <button type="submit">Create Pairing Code</button>
       </form>
       <p>Then run this in Replit with your ngrok URL:</p>
-      <pre>npx github:houseofwealth0/codexlink install --controller ${BASE_URL} --pairing-code YOUR_CODE</pre>
+      <pre>${escapeHtml(installCommand)}</pre>
     </section>
     <section>
       <h2>Connected Apps</h2>
@@ -141,6 +225,7 @@ function htmlPage() {
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/apps") return sendJson(res, 200, { apps: store.listApps() });
   if (req.method === "GET" && url.pathname === "/api/tasks") return sendJson(res, 200, { tasks: store.listTasks() });
+  if (req.method === "GET" && url.pathname === "/api/ngrok") return sendJson(res, 200, { publicUrl: await detectNgrokUrl() });
 
   if (req.method === "POST" && url.pathname === "/pairing-code") {
     const code = store.createPairingCode("dashboard");
@@ -151,8 +236,27 @@ async function handleApi(req, res, url) {
 
   if (req.method === "GET" && url.pathname === "/pairing-code") {
     const code = url.searchParams.get("code");
+    const controllerUrl = await installBaseUrl(req);
+    const command = controllerUrl === BASE_URL
+      ? "Start ngrok from the Codex Link Launcher, then refresh and create a new pairing code."
+      : `npx github:houseofwealth0/codexlink install --controller ${controllerUrl} --pairing-code ${code}`;
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pairing Code</title><style>body{font-family:system-ui;margin:32px;line-height:1.5}code,pre{font-family:ui-monospace,Consolas,monospace}pre{background:#f2f4f8;padding:16px;border-radius:8px;white-space:pre-wrap}</style></head><body><h1>Pairing Code</h1><p>Use this code in Replit:</p><pre>${code}</pre><p>Install command:</p><pre>npx github:houseofwealth0/codexlink install --controller ${externalBaseUrl(req)} --pairing-code ${code}</pre><p><a href="/">Back to dashboard</a></p></body></html>`);
+    res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pairing Code</title><style>body{font-family:system-ui;margin:32px;line-height:1.5}code,pre{font-family:ui-monospace,Consolas,monospace}pre{background:#f2f4f8;padding:16px;border-radius:8px;white-space:pre-wrap}</style></head><body><h1>Pairing Code</h1><p>Use this code in Replit:</p><pre>${escapeHtml(code)}</pre><p>Install command:</p><pre>${escapeHtml(command)}</pre><p><a href="/">Back to dashboard</a></p></body></html>`);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/shutdown") {
+    if (!isLocalRequest(req)) {
+      return sendJson(res, 403, { error: "Shutdown is only available from localhost." });
+    }
+    store.log("shutdown", "Local dashboard requested shutdown.");
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Link Shutting Down</title><style>body{font-family:system-ui;margin:32px;line-height:1.5}</style></head><body><h1>Codex Link is shutting down</h1><p>The controller and ngrok tunnel are stopping. You can close this tab.</p><p>Start it again from <code>control-center\\Start Codex Link.cmd</code>.</p></body></html>`);
+    setTimeout(async () => {
+      await stopNgrok();
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1000).unref();
+    }, 150).unref();
     return;
   }
 
@@ -215,10 +319,10 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname === "/" && req.method === "GET") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(htmlPage());
+      res.end(await htmlPage(req));
       return;
     }
-    if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url);
+    if (url.pathname.startsWith("/api/") || url.pathname === "/pairing-code" || url.pathname === "/shutdown") return await handleApi(req, res, url);
     sendJson(res, 404, { error: "Not found" });
   } catch (error) {
     sendJson(res, 500, { error: error.message });

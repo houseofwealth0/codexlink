@@ -10,6 +10,7 @@ Use these files:
    - Codex Link Controller
    - ngrok tunnel
 
+   It also opens the dashboard automatically.
    Keep those windows open while you use Codex Link.
 
 2. Open Dashboard.url
@@ -21,6 +22,7 @@ Use these files:
 
 4. Stop Codex Link.cmd
    Stops the controller on port 8787 and stops ngrok.
+   You can also use the Shut Down Codex Link button in the dashboard.
 
 Project location:
 D:\Users\colan\Documents\New project 2
