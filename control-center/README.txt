@@ -8,7 +8,7 @@ Use these files:
 1. Start Codex Link.cmd
    Opens visible windows for:
    - Codex Link Controller
-   - ngrok tunnel
+   - Cloudflare tunnel
 
    It also opens the dashboard automatically.
    Keep those windows open while you use Codex Link.
@@ -28,7 +28,7 @@ Project location:
 D:\Users\colan\Documents\New project 2
 
 Current Replit install URL:
-Use the https URL shown in the ngrok window.
+Use the https URL shown in the dashboard.
 
 Example:
 npx github:houseofwealth0/codexlink install --controller https://YOUR-NGROK-URL --pairing-code YOUR_CODE

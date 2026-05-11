@@ -64,10 +64,23 @@ async function detectNgrokUrl() {
   return tunnel?.public_url || null;
 }
 
+function detectCloudflaredUrl() {
+  const fs = require("fs");
+  const tunnelFile = path.join(DATA_DIR, "tunnel-url.txt");
+  if (!fs.existsSync(tunnelFile)) return null;
+  const value = fs.readFileSync(tunnelFile, "utf8").trim();
+  return /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(value) ? value : null;
+}
+
+async function detectPublicTunnelUrl() {
+  if (process.env.CODEX_LINK_PUBLIC_URL) return process.env.CODEX_LINK_PUBLIC_URL;
+  return detectCloudflaredUrl() || await detectNgrokUrl();
+}
+
 async function installBaseUrl(req) {
   const requestBase = externalBaseUrl(req);
   if (requestBase !== BASE_URL) return requestBase;
-  return await detectNgrokUrl() || BASE_URL;
+  return await detectPublicTunnelUrl() || BASE_URL;
 }
 
 function escapeHtml(value) {
@@ -114,10 +127,10 @@ function authenticate(req) {
   return store.authenticateApp(appId, token);
 }
 
-function stopNgrok() {
+function stopTunnelProcesses() {
   if (process.platform !== "win32") return Promise.resolve();
   return new Promise((resolve) => {
-    execFile("taskkill.exe", ["/IM", "ngrok.exe", "/F"], (error) => {
+    execFile("taskkill.exe", ["/IM", "ngrok.exe", "/IM", "cloudflared.exe", "/F"], (error) => {
       resolve({ ok: !error, error: error?.message || null });
     });
   });
@@ -129,14 +142,14 @@ async function htmlPage(req) {
   const logs = store.data.logs.slice(0, 30);
   const plans = Object.values(store.data.setupPlans).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const onlineCutoff = Date.now() - 90_000;
-  const ngrokUrl = await detectNgrokUrl();
+  const publicTunnelUrl = await detectPublicTunnelUrl();
   const publicInstallUrl = await installBaseUrl(req);
-  const installCommand = ngrokUrl
-    ? `npx --yes github:houseofwealth0/codexlink#main install --controller ${ngrokUrl} --pairing-code YOUR_CODE`
-    : "ngrok tunnel not detected. Start Codex Link Launcher, then refresh this dashboard to get the Replit install command.";
-  const ngrokStatus = ngrokUrl
-    ? `<p><span class="pill online">ngrok online</span> <code>${escapeHtml(ngrokUrl)}</code></p>`
-    : `<p><span class="pill offline">ngrok not detected</span> Start Codex Link Launcher or the ngrok window, then refresh.</p>`;
+  const installCommand = publicTunnelUrl
+    ? `npx --yes github:houseofwealth0/codexlink#main install --controller ${publicTunnelUrl} --pairing-code YOUR_CODE`
+    : "Public tunnel not detected. Start Codex Link Launcher, then refresh this dashboard to get the Replit install command.";
+  const tunnelStatus = publicTunnelUrl
+    ? `<p><span class="pill online">public tunnel online</span> <code>${escapeHtml(publicTunnelUrl)}</code></p>`
+    : `<p><span class="pill offline">public tunnel not detected</span> Start Codex Link Launcher or the tunnel window, then refresh.</p>`;
 
   return `<!doctype html>
 <html>
@@ -186,11 +199,11 @@ async function htmlPage(req) {
   <main>
     <section>
       <h2>Pair A Replit App</h2>
-      ${ngrokStatus}
+      ${tunnelStatus}
       <form method="post" action="/pairing-code">
         <button type="submit">Create Pairing Code</button>
       </form>
-      <p>Then run this in Replit with your ngrok URL:</p>
+      <p>Then run this in Replit with your public tunnel URL:</p>
       <pre>${escapeHtml(installCommand)}</pre>
     </section>
     <section>
@@ -225,7 +238,7 @@ async function htmlPage(req) {
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/apps") return sendJson(res, 200, { apps: store.listApps() });
   if (req.method === "GET" && url.pathname === "/api/tasks") return sendJson(res, 200, { tasks: store.listTasks() });
-  if (req.method === "GET" && url.pathname === "/api/ngrok") return sendJson(res, 200, { publicUrl: await detectNgrokUrl() });
+  if (req.method === "GET" && (url.pathname === "/api/ngrok" || url.pathname === "/api/tunnel")) return sendJson(res, 200, { publicUrl: await detectPublicTunnelUrl() });
 
   if (req.method === "POST" && url.pathname === "/pairing-code") {
     const code = store.createPairingCode("dashboard");
@@ -238,7 +251,7 @@ async function handleApi(req, res, url) {
     const code = url.searchParams.get("code");
     const controllerUrl = await installBaseUrl(req);
     const command = controllerUrl === BASE_URL
-      ? "Start ngrok from the Codex Link Launcher, then refresh and create a new pairing code."
+      ? "Start the public tunnel from the Codex Link Launcher, then refresh and create a new pairing code."
       : `npx --yes github:houseofwealth0/codexlink#main install --controller ${controllerUrl} --pairing-code ${code}`;
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pairing Code</title><style>body{font-family:system-ui;margin:32px;line-height:1.5}code,pre{font-family:ui-monospace,Consolas,monospace}pre{background:#f2f4f8;padding:16px;border-radius:8px;white-space:pre-wrap}</style></head><body><h1>Pairing Code</h1><p>Use this code in Replit:</p><pre>${escapeHtml(code)}</pre><p>Install command:</p><pre>${escapeHtml(command)}</pre><p><a href="/">Back to dashboard</a></p></body></html>`);
@@ -251,9 +264,9 @@ async function handleApi(req, res, url) {
     }
     store.log("shutdown", "Local dashboard requested shutdown.");
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Link Shutting Down</title><style>body{font-family:system-ui;margin:32px;line-height:1.5}</style></head><body><h1>Codex Link is shutting down</h1><p>The controller and ngrok tunnel are stopping. You can close this tab.</p><p>Start it again from <code>control-center\\Start Codex Link.cmd</code>.</p></body></html>`);
+    res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Link Shutting Down</title><style>body{font-family:system-ui;margin:32px;line-height:1.5}</style></head><body><h1>Codex Link is shutting down</h1><p>The controller and public tunnel are stopping. You can close this tab.</p><p>Start it again from <code>control-center\\Start Codex Link.cmd</code>.</p></body></html>`);
     setTimeout(async () => {
-      await stopNgrok();
+      await stopTunnelProcesses();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 1000).unref();
     }, 150).unref();
