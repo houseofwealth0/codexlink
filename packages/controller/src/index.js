@@ -132,7 +132,7 @@ async function htmlPage(req) {
   const ngrokUrl = await detectNgrokUrl();
   const publicInstallUrl = await installBaseUrl(req);
   const installCommand = ngrokUrl
-    ? `npx github:houseofwealth0/codexlink install --controller ${ngrokUrl} --pairing-code YOUR_CODE`
+    ? `npx --yes github:houseofwealth0/codexlink#main install --controller ${ngrokUrl} --pairing-code YOUR_CODE`
     : "ngrok tunnel not detected. Start Codex Link Launcher, then refresh this dashboard to get the Replit install command.";
   const ngrokStatus = ngrokUrl
     ? `<p><span class="pill online">ngrok online</span> <code>${escapeHtml(ngrokUrl)}</code></p>`
@@ -239,7 +239,7 @@ async function handleApi(req, res, url) {
     const controllerUrl = await installBaseUrl(req);
     const command = controllerUrl === BASE_URL
       ? "Start ngrok from the Codex Link Launcher, then refresh and create a new pairing code."
-      : `npx github:houseofwealth0/codexlink install --controller ${controllerUrl} --pairing-code ${code}`;
+      : `npx --yes github:houseofwealth0/codexlink#main install --controller ${controllerUrl} --pairing-code ${code}`;
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pairing Code</title><style>body{font-family:system-ui;margin:32px;line-height:1.5}code,pre{font-family:ui-monospace,Consolas,monospace}pre{background:#f2f4f8;padding:16px;border-radius:8px;white-space:pre-wrap}</style></head><body><h1>Pairing Code</h1><p>Use this code in Replit:</p><pre>${escapeHtml(code)}</pre><p>Install command:</p><pre>${escapeHtml(command)}</pre><p><a href="/">Back to dashboard</a></p></body></html>`);
     return;
