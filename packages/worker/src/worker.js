@@ -9,11 +9,18 @@ function parseArgs(argv) {
 function postJson(url, body, headers = {}) {
   return fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: {
+      "content-type": "application/json",
+      "ngrok-skip-browser-warning": "true",
+      ...headers
+    },
     body: JSON.stringify(body)
   }).then(async (response) => {
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
+    if (!response.ok) {
+      const message = payload.error || payload.message || JSON.stringify(payload).slice(0, 300) || response.statusText;
+      throw new Error(`Request failed: ${response.status} ${message}`);
+    }
     return payload;
   });
 }
