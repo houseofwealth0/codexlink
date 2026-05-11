@@ -1,4 +1,5 @@
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
+$PSNativeCommandUseErrorActionPreference = $false
 $Root = Split-Path -Parent $PSScriptRoot
 $Cloudflared = "C:\tmp\cloudflared\cloudflared.exe"
 $DataDir = Join-Path $Root "codex-link-data"
