@@ -58,12 +58,6 @@ function getJson(url, timeoutMs = 800) {
   });
 }
 
-async function detectNgrokUrl() {
-  const tunnels = await getJson("http://127.0.0.1:4040/api/tunnels");
-  const tunnel = tunnels?.tunnels?.find((candidate) => candidate.proto === "https" && candidate.public_url);
-  return tunnel?.public_url || null;
-}
-
 function detectCloudflaredUrl() {
   const fs = require("fs");
   const tunnelFile = path.join(DATA_DIR, "tunnel-url.txt");
@@ -74,7 +68,7 @@ function detectCloudflaredUrl() {
 
 async function detectPublicTunnelUrl() {
   if (process.env.CODEX_LINK_PUBLIC_URL) return process.env.CODEX_LINK_PUBLIC_URL;
-  return detectCloudflaredUrl() || await detectNgrokUrl();
+  return detectCloudflaredUrl();
 }
 
 async function installBaseUrl(req) {
@@ -130,7 +124,7 @@ function authenticate(req) {
 function stopTunnelProcesses() {
   if (process.platform !== "win32") return Promise.resolve();
   return new Promise((resolve) => {
-    execFile("taskkill.exe", ["/IM", "ngrok.exe", "/IM", "cloudflared.exe", "/F"], (error) => {
+    execFile("taskkill.exe", ["/IM", "cloudflared.exe", "/F"], (error) => {
       resolve({ ok: !error, error: error?.message || null });
     });
   });
@@ -191,7 +185,7 @@ async function htmlPage(req) {
         <h1>Codex Link</h1>
         <p>Controller: <code>${BASE_URL}</code></p>
       </div>
-      <form method="post" action="/shutdown" onsubmit="return confirm('Shut down Codex Link controller and ngrok?');">
+      <form method="post" action="/shutdown" onsubmit="return confirm('Shut down Codex Link controller and Cloudflare Tunnel?');">
         <button class="danger" type="submit">Shut Down Codex Link</button>
       </form>
     </div>
@@ -238,7 +232,7 @@ async function htmlPage(req) {
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/apps") return sendJson(res, 200, { apps: store.listApps() });
   if (req.method === "GET" && url.pathname === "/api/tasks") return sendJson(res, 200, { tasks: store.listTasks() });
-  if (req.method === "GET" && (url.pathname === "/api/ngrok" || url.pathname === "/api/tunnel")) return sendJson(res, 200, { publicUrl: await detectPublicTunnelUrl() });
+  if (req.method === "GET" && url.pathname === "/api/tunnel") return sendJson(res, 200, { publicUrl: await detectPublicTunnelUrl() });
 
   if (req.method === "POST" && url.pathname === "/pairing-code") {
     const code = store.createPairingCode("dashboard");

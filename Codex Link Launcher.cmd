@@ -16,10 +16,8 @@ start "Codex Link Controller" "%ROOT%scripts\run-controller-visible.cmd"
 
 if exist "C:\tmp\cloudflared\cloudflared.exe" (
   start "Codex Link Cloudflare Tunnel" powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\run-cloudflared-visible.ps1"
-) else if exist "C:\tmp\ngrok\ngrok.exe" (
-  start "Codex Link ngrok Tunnel" "%ROOT%scripts\run-ngrok-visible.cmd"
 ) else (
-  echo No tunnel found. Install cloudflared at C:\tmp\cloudflared\cloudflared.exe
+  echo Cloudflare Tunnel was not found at C:\tmp\cloudflared\cloudflared.exe
 )
 
 echo.

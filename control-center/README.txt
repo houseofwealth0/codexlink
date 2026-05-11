@@ -18,10 +18,10 @@ Use these files:
    http://localhost:8787/
 
 3. Check Status.cmd
-   Checks whether the controller and ngrok tunnel are reachable.
+   Checks whether the controller and Cloudflare Tunnel are reachable.
 
 4. Stop Codex Link.cmd
-   Stops the controller on port 8787 and stops ngrok.
+   Stops the controller on port 8787 and stops Cloudflare Tunnel.
    You can also use the Shut Down Codex Link button in the dashboard.
 
 Project location:
@@ -31,4 +31,4 @@ Current Replit install URL:
 Use the https URL shown in the dashboard.
 
 Example:
-npx github:houseofwealth0/codexlink install --controller https://YOUR-NGROK-URL --pairing-code YOUR_CODE
+npx --yes github:houseofwealth0/codexlink#main install --controller https://YOUR-TRYCLOUDFLARE-URL --pairing-code YOUR_CODE

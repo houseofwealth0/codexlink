@@ -17,7 +17,6 @@ function postJson(url, body, headers = {}) {
   const requestHeaders = {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(data),
-    "ngrok-skip-browser-warning": "1",
     "user-agent": `codex-link-worker/${WORKER_VERSION}`,
     ...headers
   };

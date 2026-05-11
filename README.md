@@ -43,7 +43,7 @@ npm run codex-link -- install --controller http://localhost:8787 --pairing-code 
 Install from GitHub inside Replit:
 
 ```bash
-npx github:houseofwealth0/codexlink install --controller https://YOUR-NGROK-URL --pairing-code YOURCODE
+npx --yes github:houseofwealth0/codexlink#main install --controller https://YOUR-TRYCLOUDFLARE-URL --pairing-code YOURCODE
 ```
 
 ## What Exists In This V1
