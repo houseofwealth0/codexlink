@@ -1,0 +1,7 @@
+node_modules/
+.npm-cache/
+.codex-link/
+codex-link-data*/
+*.log
+.env
+.env.local

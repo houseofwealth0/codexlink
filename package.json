@@ -1,0 +1,25 @@
+{
+  "name": "codex-link",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Agentic one-click Replit installer and Codex controller.",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node packages/controller/src/index.js",
+    "controller": "node packages/controller/src/index.js",
+    "codex-link": "node packages/cli/bin/codex-link.js",
+    "worker": "node packages/worker/src/worker.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "bin": {
+    "codex-link": "packages/cli/bin/codex-link.js"
+  },
+  "files": [
+    "packages",
+    "scripts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
