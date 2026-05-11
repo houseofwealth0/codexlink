@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 const readline = require("readline");
 const { spawn } = require("child_process");
+const http = require("http");
+const https = require("https");
 const path = require("path");
 const { scanEnvironment } = require("../../shared/src/env-scan");
 const { applyActions } = require("../../shared/src/apply-actions");
+
+const CLI_VERSION = "0.1.3";
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -36,21 +40,43 @@ function ask(question) {
 }
 
 async function postJson(url, body, headers = {}) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "ngrok-skip-browser-warning": "true",
-      ...headers
-    },
-    body: JSON.stringify(body)
+  const target = new URL(url);
+  const data = JSON.stringify(body);
+  const client = target.protocol === "https:" ? https : http;
+  const requestHeaders = {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(data),
+    "ngrok-skip-browser-warning": "1",
+    "user-agent": `codex-link-installer/${CLI_VERSION}`,
+    ...headers
+  };
+
+  return new Promise((resolve, reject) => {
+    const request = client.request(target, { method: "POST", headers: requestHeaders }, (response) => {
+      let responseBody = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        responseBody += chunk;
+      });
+      response.on("end", () => {
+        let payload = {};
+        try {
+          payload = responseBody ? JSON.parse(responseBody) : {};
+        } catch {
+          payload = { raw: responseBody.slice(0, 500) };
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          const message = payload.error || payload.message || payload.raw || JSON.stringify(payload).slice(0, 300) || response.statusMessage;
+          reject(new Error(`Request failed: ${response.statusCode} ${message}`));
+          return;
+        }
+        resolve(payload);
+      });
+    });
+    request.on("error", reject);
+    request.write(data);
+    request.end();
   });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = payload.error || payload.message || JSON.stringify(payload).slice(0, 300) || response.statusText;
-    throw new Error(`Request failed: ${response.status} ${message}`);
-  }
-  return payload;
 }
 
 function printPlan(plan, actions) {
@@ -68,6 +94,7 @@ function printPlan(plan, actions) {
 }
 
 async function install(args) {
+  console.log(`Codex Link installer ${CLI_VERSION}`);
   const controller = args.controller || process.env.CODEX_LINK_CONTROLLER || await ask("Controller URL: ");
   const pairingCode = args["pairing-code"] || process.env.CODEX_LINK_PAIRING_CODE || await ask("Telegram pairing code: ");
   const mode = args.mode || "safe";
