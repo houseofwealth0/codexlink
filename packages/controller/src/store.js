@@ -23,6 +23,7 @@ class Store {
       setupStrategies: {},
       tasks: {},
       taskEvents: {},
+      workspaceSessions: {},
       workerCommands: {},
       logs: []
     });
@@ -32,8 +33,15 @@ class Store {
     this.data.setupStrategies ||= {};
     this.data.tasks ||= {};
     this.data.taskEvents ||= {};
+    this.data.workspaceSessions ||= {};
     this.data.workerCommands ||= {};
     this.data.logs ||= [];
+    for (const app of Object.values(this.data.apps)) {
+      app.displayName ||= app.lastReport?.replit?.slug || app.lastReport?.package?.name || app.name;
+      app.tags ||= [];
+      app.notes ||= "";
+      app.localPath ||= "";
+    }
   }
 
   save() {
@@ -75,6 +83,10 @@ class Store {
       id: appId,
       token,
       name: report.appName,
+      displayName: report.replit?.slug || report.package?.name || report.appName,
+      tags: [],
+      notes: "",
+      localPath: "",
       appType: report.appType,
       packageManager: report.packageManager,
       controllerUrl,
@@ -108,6 +120,69 @@ class Store {
     Object.assign(app, patch, { updatedAt: new Date().toISOString() });
     this.save();
     return app;
+  }
+
+  updateWorkspace(appId, patch) {
+    const app = this.getApp(appId);
+    if (!app) return null;
+    const allowed = {};
+    if (Object.prototype.hasOwnProperty.call(patch, "displayName")) allowed.displayName = String(patch.displayName || app.name).trim() || app.name;
+    if (Object.prototype.hasOwnProperty.call(patch, "tags")) {
+      allowed.tags = Array.isArray(patch.tags)
+        ? patch.tags.map(String).map((tag) => tag.trim()).filter(Boolean)
+        : String(patch.tags || "").split(",").map((tag) => tag.trim()).filter(Boolean);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "notes")) allowed.notes = String(patch.notes || "");
+    if (Object.prototype.hasOwnProperty.call(patch, "localPath")) allowed.localPath = String(patch.localPath || "").trim();
+    return this.updateApp(appId, allowed);
+  }
+
+  getWorkspaceSession(appId) {
+    this.data.workspaceSessions ||= {};
+    if (!this.data.workspaceSessions[appId]) {
+      this.data.workspaceSessions[appId] = {
+        appId,
+        status: "idle",
+        transcript: [],
+        activePid: null,
+        startedAt: null,
+        stoppedAt: null,
+        updatedAt: new Date().toISOString()
+      };
+      this.save();
+    }
+    return this.data.workspaceSessions[appId];
+  }
+
+  updateWorkspaceSession(appId, patch) {
+    const session = this.getWorkspaceSession(appId);
+    Object.assign(session, patch, { updatedAt: new Date().toISOString() });
+    this.save();
+    return session;
+  }
+
+  addWorkspaceTranscript(appId, type, text, meta = {}) {
+    const session = this.getWorkspaceSession(appId);
+    const event = {
+      id: crypto.randomUUID(),
+      type,
+      text: String(text ?? ""),
+      meta,
+      createdAt: new Date().toISOString()
+    };
+    session.transcript.push(event);
+    session.transcript = session.transcript.slice(-1000);
+    session.updatedAt = new Date().toISOString();
+    this.save();
+    return event;
+  }
+
+  clearWorkspaceTranscript(appId) {
+    const session = this.getWorkspaceSession(appId);
+    session.transcript = [];
+    session.updatedAt = new Date().toISOString();
+    this.save();
+    return session;
   }
 
   recordSetupPlan(appId, plan, mode) {

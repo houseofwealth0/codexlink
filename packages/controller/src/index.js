@@ -1,6 +1,7 @@
 const http = require("http");
+const fs = require("fs");
 const path = require("path");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const { Store } = require("./store");
 const { startTelegramBot } = require("./telegram");
 const { createSetupPlan, actionsForMode } = require("../../shared/src/setup-agent");
@@ -11,6 +12,7 @@ const BASE_URL = process.env.CODEX_LINK_BASE_URL || `http://localhost:${PORT}`;
 const DATA_DIR = path.resolve(process.env.CODEX_LINK_DATA_DIR || "codex-link-data");
 
 const store = new Store(DATA_DIR);
+const activeWorkspaceProcesses = new Map();
 
 function externalBaseUrl(req) {
   const forwardedProto = req.headers["x-forwarded-proto"];
@@ -84,6 +86,81 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function workspaceName(app) {
+  return app?.displayName || app?.replit?.slug || app?.name || "Workspace";
+}
+
+function validateLocalPath(localPath) {
+  if (!localPath) return { ok: false, error: "Local path is required." };
+  const resolved = path.resolve(localPath);
+  try {
+    if (!fs.existsSync(resolved)) return { ok: false, error: "Local path does not exist." };
+    if (!fs.statSync(resolved).isDirectory()) return { ok: false, error: "Local path must be a directory." };
+    return { ok: true, path: resolved };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+function startCodexForWorkspace(appId, prompt) {
+  const app = store.getApp(appId);
+  if (!app) return { ok: false, error: "Workspace not found." };
+  if (activeWorkspaceProcesses.has(appId)) return { ok: false, error: "Codex is already running for this workspace." };
+  const validation = validateLocalPath(app.localPath);
+  if (!validation.ok) return validation;
+
+  const args = ["exec", "--cd", validation.path, "--ask-for-approval", "never", prompt];
+  store.updateWorkspaceSession(appId, {
+    status: "running",
+    startedAt: new Date().toISOString(),
+    stoppedAt: null
+  });
+  store.addWorkspaceTranscript(appId, "system", `Starting: codex ${args.join(" ")}`);
+
+  const child = spawn("codex", args, {
+    cwd: validation.path,
+    env: process.env,
+    shell: false
+  });
+  activeWorkspaceProcesses.set(appId, child);
+  store.updateWorkspaceSession(appId, { activePid: child.pid });
+
+  child.stdout.on("data", (chunk) => {
+    store.addWorkspaceTranscript(appId, "stdout", chunk.toString());
+  });
+  child.stderr.on("data", (chunk) => {
+    store.addWorkspaceTranscript(appId, "stderr", chunk.toString());
+  });
+  child.on("error", (error) => {
+    store.addWorkspaceTranscript(appId, "error", error.message);
+    store.updateWorkspaceSession(appId, { status: "failed", activePid: null, stoppedAt: new Date().toISOString() });
+    activeWorkspaceProcesses.delete(appId);
+  });
+  child.on("exit", (code, signal) => {
+    store.addWorkspaceTranscript(appId, "system", `Codex exited with code ${code ?? "null"}${signal ? ` signal ${signal}` : ""}.`);
+    store.updateWorkspaceSession(appId, {
+      status: code === 0 ? "idle" : "failed",
+      activePid: null,
+      stoppedAt: new Date().toISOString()
+    });
+    activeWorkspaceProcesses.delete(appId);
+  });
+  return { ok: true, pid: child.pid };
+}
+
+function stopCodexForWorkspace(appId) {
+  const child = activeWorkspaceProcesses.get(appId);
+  if (!child) {
+    store.updateWorkspaceSession(appId, { status: "idle", activePid: null, stoppedAt: new Date().toISOString() });
+    return { ok: true, stopped: false };
+  }
+  child.kill();
+  activeWorkspaceProcesses.delete(appId);
+  store.addWorkspaceTranscript(appId, "system", "Stop requested.");
+  store.updateWorkspaceSession(appId, { status: "stopping", activePid: null, stoppedAt: new Date().toISOString() });
+  return { ok: true, stopped: true };
 }
 
 function sendJson(res, status, payload) {
@@ -171,8 +248,12 @@ async function htmlPage(req) {
     textarea { min-height: 92px; resize: vertical; }
     button { border: 0; border-radius: 6px; background: #1f6feb; color: white; padding: 9px 12px; cursor: pointer; font-weight: 600; }
     .danger { background: #b42318; }
-    table { width: 100%; border-collapse: collapse; font-size: 14px; }
-    th, td { padding: 10px 8px; border-bottom: 1px solid #edf0f5; text-align: left; vertical-align: top; }
+    .workspace-list { display: grid; gap: 10px; }
+    .workspace-card { display: grid; grid-template-columns: minmax(180px, 1.1fr) minmax(180px, 1fr) minmax(160px, .9fr) minmax(150px, .8fr); gap: 12px; align-items: start; padding: 14px; border: 1px solid #edf0f5; border-radius: 8px; color: inherit; text-decoration: none; }
+    .workspace-card:hover { border-color: #9db7ee; background: #f8fbff; }
+    .workspace-title { font-weight: 700; font-size: 15px; }
+    .muted { color: #687386; }
+    .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
     code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f2f4f8; padding: 12px; border-radius: 6px; }
     .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #eef2ff; color: #243b7a; }
@@ -181,8 +262,12 @@ async function htmlPage(req) {
     @media (prefers-color-scheme: dark) {
       body { background: #101319; color: #eef2f7; }
       header, section { background: #171b23; border-color: #2a303b; }
-      th, td { border-color: #272d37; }
+      .workspace-card { border-color: #272d37; }
+      .workspace-card:hover { border-color: #3d65b1; background: #151b27; }
       pre { background: #11151c; }
+    }
+    @media (max-width: 840px) {
+      .workspace-card { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -209,30 +294,37 @@ async function htmlPage(req) {
       <pre>${escapeHtml(installCommand)}</pre>
     </section>
     <section>
-      <h2>Connected Apps</h2>
-      <table>
-        <thead><tr><th>Status</th><th>Name</th><th>Type</th><th>Git</th><th>Last Heartbeat</th></tr></thead>
-        <tbody>
-          ${apps.map((app) => {
+      <h2>Workspaces</h2>
+      <div class="workspace-list">
+        ${apps.map((app) => {
             const online = app.lastHeartbeatAt && Date.parse(app.lastHeartbeatAt) > onlineCutoff;
-            return `<tr><td><span class="pill ${online ? "online" : "offline"}">${online ? "online" : "offline"}</span></td><td>${app.name}<br><code>${app.id}</code></td><td>${app.appType}<br>${app.packageManager}</td><td>${app.git?.present ? "present" : "missing"}<br><code>${app.git?.branch || ""}</code></td><td>${app.lastHeartbeatAt || "never"}</td></tr>`;
-          }).join("") || `<tr><td colspan="5">No apps yet. Use <code>/connect</code> in Telegram, then run <code>npx codex-link install</code>.</td></tr>`}
-        </tbody>
-      </table>
-    </section>
-    <section>
-      <h2>Start Codex Task</h2>
-      ${apps.length ? `<form class="block-form" method="post" action="/tasks">
-        <label>App
-          <select name="appId">
-            ${apps.map((app) => `<option value="${escapeHtml(app.id)}">${escapeHtml(app.name)} (${escapeHtml(app.appType)})</option>`).join("")}
-          </select>
-        </label>
-        <label>Instruction
-          <textarea name="prompt" placeholder="Tell Codex what to inspect or change..."></textarea>
-        </label>
-        <button type="submit">Start Live Task</button>
-      </form>` : "Connect an app before starting a task."}
+            const report = app.lastReport || {};
+            const replit = report.replit || {};
+            const git = app.git || {};
+            const tags = (app.tags || []).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
+            return `<a class="workspace-card" href="/workspaces/${escapeHtml(app.id)}">
+              <div>
+                <div><span class="pill ${online ? "online" : "offline"}">${online ? "online" : "offline"}</span></div>
+                <div class="workspace-title">${escapeHtml(workspaceName(app))}</div>
+                <div class="muted"><code>${escapeHtml(app.id)}</code></div>
+                <div class="tags">${tags}</div>
+              </div>
+              <div>
+                <strong>${escapeHtml(replit.owner || "unknown owner")}/${escapeHtml(replit.slug || app.name || "unknown")}</strong>
+                <div class="muted">${escapeHtml(app.appType || "unknown")} - ${escapeHtml(app.packageManager || "unknown package manager")}</div>
+              </div>
+              <div>
+                <strong>${git.present ? "Git connected" : "Git missing"}</strong>
+                <div class="muted"><code>${escapeHtml(git.branch || "no branch")}</code></div>
+                <div class="muted"><code>${escapeHtml(git.remote || "no remote")}</code></div>
+              </div>
+              <div>
+                <strong>Last heartbeat</strong>
+                <div class="muted">${escapeHtml(app.lastHeartbeatAt || "never")}</div>
+              </div>
+            </a>`;
+          }).join("") || `<p>No apps yet. Use <code>/connect</code> in Telegram, then run <code>npx codex-link install</code>.</p>`}
+      </div>
     </section>
     <section>
       <h2>Setup Plans</h2>
@@ -318,6 +410,158 @@ function taskPage(taskId) {
 </html>`;
 }
 
+function workspacePage(appId) {
+  const app = store.getApp(appId);
+  if (!app) {
+    return `<!doctype html><html><body><h1>Workspace not found</h1><p><a href="/">Back to dashboard</a></p></body></html>`;
+  }
+  const session = store.getWorkspaceSession(appId);
+  const onlineCutoff = Date.now() - 90_000;
+  const online = app.lastHeartbeatAt && Date.parse(app.lastHeartbeatAt) > onlineCutoff;
+  const report = app.lastReport || {};
+  const replit = report.replit || {};
+  const git = app.git || {};
+  const pathStatus = validateLocalPath(app.localPath);
+  const tags = (app.tags || []).join(", ");
+  const notes = app.notes || "";
+  const localPath = app.localPath || "";
+  const promptDisabled = pathStatus.ok ? "" : "disabled";
+  const promptHint = pathStatus.ok
+    ? `Codex will run locally in ${pathStatus.path}`
+    : pathStatus.error;
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(workspaceName(app))} - Codex Link</title>
+  <style>
+    :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f7f8fb; color: #1b1f2a; }
+    header { padding: 22px 24px; background: #fff; border-bottom: 1px solid #dfe3ea; }
+    main { max-width: 1280px; margin: 0 auto; padding: 20px; display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 18px; align-items: start; }
+    h1 { margin: 6px 0 4px; font-size: 24px; }
+    h2 { margin: 0 0 12px; font-size: 16px; }
+    section { background: #fff; border: 1px solid #dfe3ea; border-radius: 8px; padding: 16px; }
+    label { display: grid; gap: 6px; font-weight: 600; }
+    input, textarea { width: 100%; box-sizing: border-box; font: inherit; border: 1px solid #cfd6e3; border-radius: 6px; padding: 9px; background: #fff; color: inherit; }
+    textarea { resize: vertical; }
+    button { border: 0; border-radius: 6px; background: #1f6feb; color: white; padding: 9px 12px; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .danger { background: #b42318; }
+    .secondary { background: #475467; }
+    .header-row, .controls { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+    .terminal-wrap { display: grid; grid-template-rows: minmax(360px, 62vh) auto; overflow: hidden; }
+    #terminal { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; overflow-y: auto; background: #0d1117; color: #e6edf3; padding: 14px; border-radius: 8px; font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .prompt-form { display: grid; gap: 10px; margin-top: 12px; }
+    .side { display: grid; gap: 14px; }
+    .meta { display: grid; gap: 8px; font-size: 14px; }
+    .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #eef2ff; color: #243b7a; }
+    .online { background: #e8f7ee; color: #14532d; }
+    .offline { background: #f3f4f6; color: #4b5563; }
+    .warning { background: #fff7ed; border-color: #fed7aa; }
+    .muted { color: #687386; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    form.inline { display: inline; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #101319; color: #eef2f7; }
+      header, section { background: #171b23; border-color: #2a303b; }
+      input, textarea { background: #11151c; border-color: #333b49; }
+      .warning { background: #2a2117; border-color: #704214; }
+    }
+    @media (max-width: 960px) {
+      main { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-row">
+      <div>
+        <p><a href="/">Back to dashboard</a></p>
+        <h1>${escapeHtml(workspaceName(app))}</h1>
+        <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span></p>
+      </div>
+      <div class="controls">
+        <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/clear" onsubmit="return confirm('Clear this workspace transcript?');">
+          <button class="secondary" type="submit">Clear Transcript</button>
+        </form>
+        <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/stop">
+          <button class="danger" type="submit">Stop Session</button>
+        </form>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section>
+      <h2>Live Codex Terminal</h2>
+      <div class="terminal-wrap">
+        <pre id="terminal"></pre>
+        <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/prompt">
+          <label>Prompt
+            <textarea name="prompt" rows="4" ${promptDisabled} placeholder="Tell Codex what to do in this workspace..."></textarea>
+          </label>
+          <div class="header-row">
+            <span class="muted">${escapeHtml(promptHint)}</span>
+            <button type="submit" ${promptDisabled}>Start Codex Run</button>
+          </div>
+        </form>
+      </div>
+    </section>
+    <aside class="side">
+      ${pathStatus.ok ? "" : `<section class="warning"><h2>Local Path Needed</h2><p>Set the folder on this PC that contains the matching project checkout. Codex runs here, not inside Replit.</p></section>`}
+      <section>
+        <h2>Workspace Settings</h2>
+        <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/settings">
+          <label>Name
+            <input name="displayName" value="${escapeHtml(workspaceName(app))}" />
+          </label>
+          <label>Tags
+            <input name="tags" value="${escapeHtml(tags)}" placeholder="client, production, node" />
+          </label>
+          <label>Local Path
+            <input name="localPath" value="${escapeHtml(localPath)}" placeholder="D:\\Users\\colan\\Documents\\my-app" />
+          </label>
+          <label>Notes
+            <textarea name="notes" rows="4">${escapeHtml(notes)}</textarea>
+          </label>
+          <button type="submit">Save Workspace</button>
+        </form>
+      </section>
+      <section>
+        <h2>Replit Worker</h2>
+        <div class="meta">
+          <div><strong>Replit</strong><br><code>${escapeHtml(replit.owner || "unknown")}/${escapeHtml(replit.slug || app.name || "unknown")}</code></div>
+          <div><strong>Type</strong><br>${escapeHtml(app.appType || "unknown")} - ${escapeHtml(app.packageManager || "unknown")}</div>
+          <div><strong>Git</strong><br>${git.present ? "present" : "missing"} - <code>${escapeHtml(git.branch || "no branch")}</code><br><code>${escapeHtml(git.remote || "no remote")}</code></div>
+          <div><strong>Last heartbeat</strong><br>${escapeHtml(app.lastHeartbeatAt || "never")}</div>
+          <div><strong>Worker mode</strong><br>${escapeHtml(app.workerMode || "workspace")}</div>
+        </div>
+      </section>
+    </aside>
+  </main>
+  <script>
+    const terminal = document.getElementById('terminal');
+    const status = document.getElementById('session-status');
+    function appendEvent(event) {
+      const when = new Date(event.createdAt).toLocaleTimeString();
+      const prefix = '[' + when + '] ' + event.type + ': ';
+      terminal.textContent += prefix + event.text;
+      if (!event.text.endsWith('\\n')) terminal.textContent += '\\n';
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+    const source = new EventSource('/workspaces/${escapeHtml(app.id)}/events');
+    source.onmessage = (message) => {
+      const payload = JSON.parse(message.data);
+      if (payload.session?.status) status.textContent = payload.session.status;
+      for (const event of payload.events || []) appendEvent(event);
+    };
+  </script>
+</body>
+</html>`;
+}
+
 function parseForm(body) {
   const params = new URLSearchParams(body);
   return Object.fromEntries(params.entries());
@@ -353,6 +597,25 @@ function taskSse(req, res, taskId) {
   };
   send();
   const interval = setInterval(send, 1500);
+  req.on("close", () => clearInterval(interval));
+}
+
+function workspaceSse(req, res, appId) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive"
+  });
+  let lastIndex = 0;
+  const send = () => {
+    const session = store.getWorkspaceSession(appId);
+    const transcript = session.transcript || [];
+    const nextEvents = transcript.slice(lastIndex);
+    lastIndex = transcript.length;
+    res.write(`data: ${JSON.stringify({ session, events: nextEvents })}\n\n`);
+  };
+  send();
+  const interval = setInterval(send, 1000);
   req.on("close", () => clearInterval(interval));
 }
 
@@ -392,6 +655,66 @@ async function handleApi(req, res, url) {
       setTimeout(() => process.exit(0), 1000).unref();
     }, 150).unref();
     return;
+  }
+
+  const workspaceMatch = url.pathname.match(/^\/workspaces\/([^/]+)$/);
+  if (req.method === "GET" && workspaceMatch) {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(workspacePage(workspaceMatch[1]));
+    return;
+  }
+
+  const workspaceEventsMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/events$/);
+  if (req.method === "GET" && workspaceEventsMatch) {
+    if (!store.getApp(workspaceEventsMatch[1])) return sendJson(res, 404, { error: "Workspace not found." });
+    return workspaceSse(req, res, workspaceEventsMatch[1]);
+  }
+
+  const workspaceSettingsMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/settings$/);
+  if (req.method === "POST" && workspaceSettingsMatch) {
+    const form = parseForm(await readRawBody(req));
+    const app = store.updateWorkspace(workspaceSettingsMatch[1], {
+      displayName: form.displayName,
+      tags: form.tags,
+      notes: form.notes,
+      localPath: form.localPath
+    });
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    store.addWorkspaceTranscript(app.id, "system", "Workspace settings updated.");
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspacePromptMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/prompt$/);
+  if (req.method === "POST" && workspacePromptMatch) {
+    const app = store.getApp(workspacePromptMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    const form = parseForm(await readRawBody(req));
+    const prompt = String(form.prompt || "").trim();
+    if (!prompt) {
+      store.addWorkspaceTranscript(app.id, "error", "Prompt is required.");
+      return redirect(res, `/workspaces/${app.id}`);
+    }
+    store.addWorkspaceTranscript(app.id, "prompt", prompt);
+    const started = startCodexForWorkspace(app.id, prompt);
+    if (!started.ok) store.addWorkspaceTranscript(app.id, "error", started.error);
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceStopMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/stop$/);
+  if (req.method === "POST" && workspaceStopMatch) {
+    const app = store.getApp(workspaceStopMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    stopCodexForWorkspace(app.id);
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceClearMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/clear$/);
+  if (req.method === "POST" && workspaceClearMatch) {
+    const app = store.getApp(workspaceClearMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    store.clearWorkspaceTranscript(app.id);
+    store.addWorkspaceTranscript(app.id, "system", "Transcript cleared.");
+    return redirect(res, `/workspaces/${app.id}`);
   }
 
   if (req.method === "POST" && url.pathname === "/tasks") {
@@ -524,7 +847,11 @@ const server = http.createServer(async (req, res) => {
       res.end(await htmlPage(req));
       return;
     }
-    if (url.pathname.startsWith("/api/") || url.pathname === "/pairing-code" || url.pathname === "/shutdown" || url.pathname.startsWith("/tasks")) return await handleApi(req, res, url);
+    if (url.pathname.startsWith("/api/")
+      || url.pathname === "/pairing-code"
+      || url.pathname === "/shutdown"
+      || url.pathname.startsWith("/tasks")
+      || url.pathname.startsWith("/workspaces")) return await handleApi(req, res, url);
     sendJson(res, 404, { error: "Not found" });
   } catch (error) {
     sendJson(res, 500, { error: error.message });
