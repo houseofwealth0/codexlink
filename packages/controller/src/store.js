@@ -41,6 +41,9 @@ class Store {
       app.tags ||= [];
       app.notes ||= "";
       app.localPath ||= "";
+      app.cloneStatus ||= app.git?.remote
+        ? { status: app.localPath ? "ready" : "pending", remote: app.git.remote, path: app.localPath || null, message: app.localPath ? "Local checkout configured." : "Waiting to clone." }
+        : { status: "skipped", remote: null, path: null, message: "No Git remote detected." };
     }
   }
 
@@ -87,6 +90,9 @@ class Store {
       tags: [],
       notes: "",
       localPath: "",
+      cloneStatus: report.git?.remote
+        ? { status: "pending", remote: report.git.remote, path: null, message: "Local clone queued." }
+        : { status: "skipped", remote: null, path: null, message: "No Git remote detected; automatic clone is unavailable." },
       appType: report.appType,
       packageManager: report.packageManager,
       controllerUrl,

@@ -10,9 +10,11 @@ const PORT = Number(process.env.CODEX_LINK_PORT || 8787);
 const HOST = process.env.CODEX_LINK_HOST || "0.0.0.0";
 const BASE_URL = process.env.CODEX_LINK_BASE_URL || `http://localhost:${PORT}`;
 const DATA_DIR = path.resolve(process.env.CODEX_LINK_DATA_DIR || "codex-link-data");
+const WORKSPACES_DIR = path.resolve(process.env.CODEX_LINK_WORKSPACES_DIR || "codex-link-workspaces");
 
 const store = new Store(DATA_DIR);
 const activeWorkspaceProcesses = new Map();
+const activeCloneProcesses = new Map();
 
 function externalBaseUrl(req) {
   const forwardedProto = req.headers["x-forwarded-proto"];
@@ -92,6 +94,21 @@ function workspaceName(app) {
   return app?.displayName || app?.replit?.slug || app?.name || "Workspace";
 }
 
+function safeSegment(value) {
+  return String(value || "workspace")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "workspace";
+}
+
+function defaultWorkspacePath(app) {
+  const report = app.lastReport || {};
+  const replit = report.replit || {};
+  const label = `${safeSegment(replit.owner || "replit")}-${safeSegment(replit.slug || app.name)}-${app.id.slice(0, 8)}`;
+  return path.join(WORKSPACES_DIR, label);
+}
+
 function validateLocalPath(localPath) {
   if (!localPath) return { ok: false, error: "Local path is required." };
   const resolved = path.resolve(localPath);
@@ -102,6 +119,127 @@ function validateLocalPath(localPath) {
   } catch (error) {
     return { ok: false, error: error.message };
   }
+}
+
+function updateCloneStatus(appId, patch) {
+  const app = store.getApp(appId);
+  if (!app) return null;
+  const next = {
+    ...(app.cloneStatus || {}),
+    ...patch,
+    updatedAt: new Date().toISOString()
+  };
+  return store.updateApp(appId, { cloneStatus: next });
+}
+
+function startWorkspaceClone(appId) {
+  const app = store.getApp(appId);
+  if (!app) return { ok: false, error: "Workspace not found." };
+  if (activeCloneProcesses.has(appId)) return { ok: true, running: true };
+
+  const remote = app.git?.remote || app.lastReport?.git?.remote;
+  if (!remote) {
+    updateCloneStatus(appId, {
+      status: "skipped",
+      remote: null,
+      path: null,
+      message: "No Git remote detected; automatic clone is unavailable."
+    });
+    store.addWorkspaceTranscript(appId, "clone", "Automatic clone skipped: no Git remote detected.");
+    return { ok: false, error: "No Git remote detected." };
+  }
+
+  const existing = validateLocalPath(app.localPath);
+  if (existing.ok && fs.existsSync(path.join(existing.path, ".git"))) {
+    updateCloneStatus(appId, {
+      status: "ready",
+      remote,
+      path: existing.path,
+      message: "Local checkout already exists."
+    });
+    return { ok: true, path: existing.path, alreadyReady: true };
+  }
+
+  const targetPath = defaultWorkspacePath(app);
+  fs.mkdirSync(WORKSPACES_DIR, { recursive: true });
+
+  if (fs.existsSync(targetPath)) {
+    const entries = fs.readdirSync(targetPath);
+    if (fs.existsSync(path.join(targetPath, ".git"))) {
+      store.updateWorkspace(appId, { localPath: targetPath });
+      updateCloneStatus(appId, {
+        status: "ready",
+        remote,
+        path: targetPath,
+        message: "Local checkout already exists."
+      });
+      return { ok: true, path: targetPath, alreadyReady: true };
+    }
+    if (entries.length > 0) {
+      updateCloneStatus(appId, {
+        status: "failed",
+        remote,
+        path: targetPath,
+        message: "Target folder exists and is not an empty Git checkout."
+      });
+      return { ok: false, error: "Target folder exists and is not an empty Git checkout." };
+    }
+  }
+
+  updateCloneStatus(appId, {
+    status: "running",
+    remote,
+    path: targetPath,
+    message: "Cloning local checkout..."
+  });
+  store.addWorkspaceTranscript(appId, "clone", `Cloning ${remote} into ${targetPath}\n`);
+
+  const child = spawn("git", ["clone", remote, targetPath], {
+    cwd: WORKSPACES_DIR,
+    env: process.env,
+    shell: false
+  });
+  activeCloneProcesses.set(appId, child);
+
+  child.stdout.on("data", (chunk) => {
+    store.addWorkspaceTranscript(appId, "clone", chunk.toString());
+  });
+  child.stderr.on("data", (chunk) => {
+    store.addWorkspaceTranscript(appId, "clone", chunk.toString());
+  });
+  child.on("error", (error) => {
+    activeCloneProcesses.delete(appId);
+    updateCloneStatus(appId, {
+      status: "failed",
+      remote,
+      path: targetPath,
+      message: error.message
+    });
+    store.addWorkspaceTranscript(appId, "error", `Clone failed: ${error.message}`);
+  });
+  child.on("exit", (code, signal) => {
+    activeCloneProcesses.delete(appId);
+    if (code === 0) {
+      store.updateWorkspace(appId, { localPath: targetPath });
+      updateCloneStatus(appId, {
+        status: "ready",
+        remote,
+        path: targetPath,
+        message: "Local checkout ready."
+      });
+      store.addWorkspaceTranscript(appId, "clone", `Local checkout ready at ${targetPath}\n`);
+      return;
+    }
+    const message = `git clone exited with code ${code ?? "null"}${signal ? ` signal ${signal}` : ""}.`;
+    updateCloneStatus(appId, {
+      status: "failed",
+      remote,
+      path: targetPath,
+      message
+    });
+    store.addWorkspaceTranscript(appId, "error", `Clone failed: ${message}`);
+  });
+  return { ok: true, path: targetPath, pid: child.pid };
 }
 
 function startCodexForWorkspace(appId, prompt) {
@@ -301,6 +439,8 @@ async function htmlPage(req) {
             const report = app.lastReport || {};
             const replit = report.replit || {};
             const git = app.git || {};
+            const clone = app.cloneStatus || {};
+            const cloneClass = clone.status === "ready" ? "online" : clone.status === "failed" ? "offline" : "";
             const tags = (app.tags || []).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
             return `<a class="workspace-card" href="/workspaces/${escapeHtml(app.id)}">
               <div>
@@ -321,6 +461,7 @@ async function htmlPage(req) {
               <div>
                 <strong>Last heartbeat</strong>
                 <div class="muted">${escapeHtml(app.lastHeartbeatAt || "never")}</div>
+                <div><span class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></div>
               </div>
             </a>`;
           }).join("") || `<p>No apps yet. Use <code>/connect</code> in Telegram, then run <code>npx codex-link install</code>.</p>`}
@@ -421,7 +562,9 @@ function workspacePage(appId) {
   const report = app.lastReport || {};
   const replit = report.replit || {};
   const git = app.git || {};
+  const clone = app.cloneStatus || {};
   const pathStatus = validateLocalPath(app.localPath);
+  const cloneClass = clone.status === "ready" ? "online" : clone.status === "failed" ? "offline" : "";
   const tags = (app.tags || []).join(", ");
   const notes = app.notes || "";
   const localPath = app.localPath || "";
@@ -481,7 +624,7 @@ function workspacePage(appId) {
       <div>
         <p><a href="/">Back to dashboard</a></p>
         <h1>${escapeHtml(workspaceName(app))}</h1>
-        <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span></p>
+        <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span> <span id="clone-status" class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></p>
       </div>
       <div class="controls">
         <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/clear" onsubmit="return confirm('Clear this workspace transcript?');">
@@ -510,7 +653,18 @@ function workspacePage(appId) {
       </div>
     </section>
     <aside class="side">
-      ${pathStatus.ok ? "" : `<section class="warning"><h2>Local Path Needed</h2><p>Set the folder on this PC that contains the matching project checkout. Codex runs here, not inside Replit.</p></section>`}
+      ${pathStatus.ok ? "" : `<section class="warning"><h2>Local Checkout Needed</h2><p>Codex needs a local checkout on this PC. Codex Link tries to clone it automatically from the Replit app's Git remote during install.</p></section>`}
+      <section>
+        <h2>Local Checkout</h2>
+        <div class="meta">
+          <div><strong>Status</strong><br><span id="clone-message">${escapeHtml(clone.message || "No clone status yet.")}</span></div>
+          <div><strong>Remote</strong><br><code>${escapeHtml(clone.remote || git.remote || "no remote detected")}</code></div>
+          <div><strong>Path</strong><br><code id="clone-path">${escapeHtml(clone.path || app.localPath || "not ready yet")}</code></div>
+        </div>
+        <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/clone">
+          <button type="submit">Clone / Retry Local Checkout</button>
+        </form>
+      </section>
       <section>
         <h2>Workspace Settings</h2>
         <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/settings">
@@ -555,6 +709,16 @@ function workspacePage(appId) {
     source.onmessage = (message) => {
       const payload = JSON.parse(message.data);
       if (payload.session?.status) status.textContent = payload.session.status;
+      if (payload.app?.cloneStatus) {
+        const clone = payload.app.cloneStatus;
+        const cloneStatus = document.getElementById('clone-status');
+        const cloneMessage = document.getElementById('clone-message');
+        const clonePath = document.getElementById('clone-path');
+        cloneStatus.textContent = 'clone: ' + (clone.status || 'unknown');
+        cloneStatus.className = 'pill ' + (clone.status === 'ready' ? 'online' : clone.status === 'failed' ? 'offline' : '');
+        cloneMessage.textContent = clone.message || 'No clone status yet.';
+        clonePath.textContent = clone.path || 'not ready yet';
+      }
       for (const event of payload.events || []) appendEvent(event);
     };
   </script>
@@ -612,7 +776,8 @@ function workspaceSse(req, res, appId) {
     const transcript = session.transcript || [];
     const nextEvents = transcript.slice(lastIndex);
     lastIndex = transcript.length;
-    res.write(`data: ${JSON.stringify({ session, events: nextEvents })}\n\n`);
+    const app = store.getApp(appId);
+    res.write(`data: ${JSON.stringify({ app: app ? { id: app.id, cloneStatus: app.cloneStatus, localPath: app.localPath } : null, session, events: nextEvents })}\n\n`);
   };
   send();
   const interval = setInterval(send, 1000);
@@ -680,7 +845,24 @@ async function handleApi(req, res, url) {
       localPath: form.localPath
     });
     if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    const localPathStatus = validateLocalPath(app.localPath);
+    if (localPathStatus.ok) {
+      updateCloneStatus(app.id, {
+        status: "ready",
+        remote: app.git?.remote || app.cloneStatus?.remote || null,
+        path: localPathStatus.path,
+        message: "Local checkout configured."
+      });
+    }
     store.addWorkspaceTranscript(app.id, "system", "Workspace settings updated.");
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceCloneMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/clone$/);
+  if (req.method === "POST" && workspaceCloneMatch) {
+    const app = store.getApp(workspaceCloneMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    startWorkspaceClone(app.id);
     return redirect(res, `/workspaces/${app.id}`);
   }
 
@@ -779,8 +961,10 @@ async function handleApi(req, res, url) {
     const savedPlan = store.recordSetupPlan(app.id, plan, mode);
     const split = actionsForMode(plan, mode);
     store.log("pair", `App paired: ${app.name}`, { appId: app.id, planId: plan.id, mode });
+    startWorkspaceClone(app.id);
+    const pairedApp = store.getApp(app.id);
     return sendJson(res, 200, {
-      app: { id: app.id, token: app.token, name: app.name },
+      app: { id: app.id, token: app.token, name: app.name, cloneStatus: pairedApp?.cloneStatus || app.cloneStatus },
       plan: savedPlan,
       actions: split
     });

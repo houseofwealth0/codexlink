@@ -2,6 +2,7 @@ node_modules/
 .npm-cache/
 .codex-link/
 codex-link-data*/
+codex-link-workspaces*/
 *.log
 .env
 .env.local

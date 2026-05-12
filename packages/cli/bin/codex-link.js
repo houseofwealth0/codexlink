@@ -103,6 +103,9 @@ async function install(args) {
 
   console.log(`Scanned ${report.appName}: ${report.appType}, ${report.packageManager}`);
   const pair = await postJson(`${controller.replace(/\/$/, "")}/api/pair`, { pairingCode, report, mode });
+  if (pair.app?.cloneStatus?.status) {
+    console.log(`Controller local clone: ${pair.app.cloneStatus.status} - ${pair.app.cloneStatus.message || ""}`);
+  }
   printPlan(pair.plan, pair.actions);
 
   let approved = args.yes || mode === "auto";
