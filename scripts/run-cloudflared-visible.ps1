@@ -10,6 +10,16 @@ $LogFile = Join-Path $LogDir "cloudflared.log"
 Set-Location $Root
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Remove-Item -LiteralPath $TunnelFile -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $LogFile -Force -ErrorAction SilentlyContinue
+
+function Write-CloudflaredLog {
+  param([string]$Line)
+  try {
+    [System.IO.File]::AppendAllText($LogFile, $Line + [Environment]::NewLine)
+  } catch {
+    # The visible console is the source of truth. Logging is best-effort.
+  }
+}
 
 try {
   Write-Host "Codex Link Cloudflare Tunnel"
@@ -24,12 +34,12 @@ try {
 
   for ($attempt = 1; $attempt -le 3; $attempt++) {
     Write-Host "Starting Cloudflare quick tunnel (attempt $attempt of 3)..."
-    Add-Content -LiteralPath $LogFile -Value "=== Cloudflare tunnel attempt $attempt $(Get-Date -Format o) ==="
+    Write-CloudflaredLog "=== Cloudflare tunnel attempt $attempt $(Get-Date -Format o) ==="
 
     & $Cloudflared tunnel --url http://127.0.0.1:8787 2>&1 | ForEach-Object {
       $line = "$_"
-      Add-Content -LiteralPath $LogFile -Value $line
-      $match = [regex]::Match($line, "https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+      Write-CloudflaredLog $line
+      $match = [regex]::Match($line, "https://(?!api\.)([a-zA-Z0-9-]+)\.trycloudflare\.com")
       if ($match.Success) {
         Set-Content -LiteralPath $TunnelFile -Value $match.Value
         Write-Host ""
@@ -56,7 +66,7 @@ try {
   Write-Host ""
   Write-Host "Cloudflare tunnel failed:"
   Write-Host $_.Exception.Message
-  Add-Content -LiteralPath $LogFile -Value "FAILED: $($_.Exception.Message)"
+  Write-CloudflaredLog "FAILED: $($_.Exception.Message)"
 } finally {
   Write-Host ""
   Write-Host "Cloudflare tunnel window is staying open so you can read what happened."

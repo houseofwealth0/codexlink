@@ -26,6 +26,14 @@ class Store {
       workerCommands: {},
       logs: []
     });
+    this.data.apps ||= {};
+    this.data.pairingCodes ||= {};
+    this.data.setupPlans ||= {};
+    this.data.setupStrategies ||= {};
+    this.data.tasks ||= {};
+    this.data.taskEvents ||= {};
+    this.data.workerCommands ||= {};
+    this.data.logs ||= [];
   }
 
   save() {
@@ -197,6 +205,7 @@ class Store {
   }
 
   enqueueWorkerCommand(appId, command) {
+    this.data.workerCommands ||= {};
     if (!this.data.workerCommands[appId]) this.data.workerCommands[appId] = [];
     const queued = {
       id: crypto.randomUUID(),
@@ -211,6 +220,7 @@ class Store {
   }
 
   takeWorkerCommands(appId) {
+    this.data.workerCommands ||= {};
     const commands = this.data.workerCommands[appId] || [];
     const queued = commands.filter((command) => command.status === "queued");
     for (const command of queued) {
@@ -222,6 +232,7 @@ class Store {
   }
 
   completeWorkerCommand(appId, commandId, result) {
+    this.data.workerCommands ||= {};
     const commands = this.data.workerCommands[appId] || [];
     const command = commands.find((candidate) => candidate.id === commandId);
     if (!command) return null;
