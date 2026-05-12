@@ -6,12 +6,12 @@ This folder is your local control panel for Codex Link.
 Use these files:
 
 1. Start Codex Link.cmd
-   Opens visible windows for:
+   Opens one visible terminal that runs:
    - Codex Link Controller
-   - Cloudflare tunnel
+   - Cloudflare Tunnel
 
    It also opens the dashboard automatically.
-   Keep those windows open while you use Codex Link.
+   Keep that terminal open while you use Codex Link.
 
 2. Open Dashboard.url
    Opens the local dashboard:
