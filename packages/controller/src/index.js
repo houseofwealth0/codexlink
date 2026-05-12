@@ -109,6 +109,15 @@ function defaultWorkspacePath(app) {
   return path.join(WORKSPACES_DIR, label);
 }
 
+function workerReconnectCommand(app, controllerUrl) {
+  if (!app || !controllerUrl || controllerUrl === BASE_URL) return null;
+  return `npx --yes github:houseofwealth0/codexlink#main reconnect --controller ${controllerUrl} --app-id ${app.id}`;
+}
+
+function needsWorkerReconnect(app, publicUrl) {
+  return Boolean(app?.controllerUrl && publicUrl && app.controllerUrl !== publicUrl);
+}
+
 function validateLocalPath(localPath) {
   if (!localPath) return { ok: false, error: "Local path is required." };
   const resolved = path.resolve(localPath);
@@ -441,13 +450,14 @@ async function htmlPage(req) {
             const git = app.git || {};
             const clone = app.cloneStatus || {};
             const cloneClass = clone.status === "ready" ? "online" : clone.status === "failed" ? "offline" : "";
+            const reconnectNeeded = needsWorkerReconnect(app, publicTunnelUrl);
             const tags = (app.tags || []).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
             return `<a class="workspace-card" href="/workspaces/${escapeHtml(app.id)}">
               <div>
                 <div><span class="pill ${online ? "online" : "offline"}">${online ? "online" : "offline"}</span></div>
                 <div class="workspace-title">${escapeHtml(workspaceName(app))}</div>
                 <div class="muted"><code>${escapeHtml(app.id)}</code></div>
-                <div class="tags">${tags}</div>
+                <div class="tags">${reconnectNeeded ? `<span class="pill offline">reconnect needed</span>` : ""}${tags}</div>
               </div>
               <div>
                 <strong>${escapeHtml(replit.owner || "unknown owner")}/${escapeHtml(replit.slug || app.name || "unknown")}</strong>
@@ -551,7 +561,7 @@ function taskPage(taskId) {
 </html>`;
 }
 
-function workspacePage(appId) {
+async function workspacePage(appId, req) {
   const app = store.getApp(appId);
   if (!app) {
     return `<!doctype html><html><body><h1>Workspace not found</h1><p><a href="/">Back to dashboard</a></p></body></html>`;
@@ -565,6 +575,9 @@ function workspacePage(appId) {
   const clone = app.cloneStatus || {};
   const pathStatus = validateLocalPath(app.localPath);
   const cloneClass = clone.status === "ready" ? "online" : clone.status === "failed" ? "offline" : "";
+  const publicControllerUrl = await installBaseUrl(req);
+  const reconnectNeeded = needsWorkerReconnect(app, publicControllerUrl);
+  const reconnectCommand = workerReconnectCommand(app, publicControllerUrl);
   const tags = (app.tags || []).join(", ");
   const notes = app.notes || "";
   const localPath = app.localPath || "";
@@ -653,6 +666,7 @@ function workspacePage(appId) {
       </div>
     </section>
     <aside class="side">
+      ${reconnectNeeded && reconnectCommand ? `<section class="warning"><h2>Worker Reconnect Needed</h2><p>This workspace was installed with an older public tunnel URL. Run this once in that Replit workspace to update the existing worker without creating a duplicate app.</p><pre>${escapeHtml(reconnectCommand)}</pre></section>` : ""}
       ${pathStatus.ok ? "" : `<section class="warning"><h2>Local Checkout Needed</h2><p>Codex needs a local checkout on this PC. Codex Link tries to clone it automatically from the Replit app's Git remote during install.</p></section>`}
       <section>
         <h2>Local Checkout</h2>
@@ -825,7 +839,7 @@ async function handleApi(req, res, url) {
   const workspaceMatch = url.pathname.match(/^\/workspaces\/([^/]+)$/);
   if (req.method === "GET" && workspaceMatch) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(workspacePage(workspaceMatch[1]));
+    res.end(await workspacePage(workspaceMatch[1], req));
     return;
   }
 
@@ -968,6 +982,27 @@ async function handleApi(req, res, url) {
       plan: savedPlan,
       actions: split
     });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/reconnect") {
+    const app = authenticate(req);
+    if (!app) return sendJson(res, 401, { error: "Unauthorized" });
+    const body = await readBody(req);
+    const controllerUrl = body.controllerUrl || externalBaseUrl(req);
+    const patch = {
+      controllerUrl,
+      status: "reconnected",
+      lastReconnectAt: new Date().toISOString()
+    };
+    if (body.report) {
+      patch.lastReport = body.report;
+      patch.git = body.report.git || app.git;
+      patch.appType = body.report.appType || app.appType;
+      patch.packageManager = body.report.packageManager || app.packageManager;
+    }
+    const updated = store.updateApp(app.id, patch);
+    store.log("reconnect", `App reconnected: ${app.name}`, { appId: app.id, controllerUrl });
+    return sendJson(res, 200, { ok: true, app: { id: updated.id, name: updated.name, controllerUrl: updated.controllerUrl } });
   }
 
   if (req.method === "POST" && url.pathname === "/api/heartbeat") {

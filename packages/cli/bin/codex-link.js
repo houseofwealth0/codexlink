@@ -40,6 +40,71 @@ function ask(question) {
   });
 }
 
+function readJsonFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function shellJsonValue(value) {
+  return JSON.stringify(String(value || ""));
+}
+
+function readWorkerCredentials(root) {
+  const config = readJsonFile(path.join(root, ".codex-link", "config.json")) || {};
+  const daemonPath = path.join(root, ".codex-link", "worker-daemon.sh");
+  const daemon = fs.existsSync(daemonPath) ? fs.readFileSync(daemonPath, "utf8") : "";
+  const readExport = (name) => {
+    const match = daemon.match(new RegExp(`^export ${name}=(.+)$`, "m"));
+    if (!match) return null;
+    try {
+      return JSON.parse(match[1]);
+    } catch {
+      return match[1].replace(/^["']|["']$/g, "");
+    }
+  };
+  return {
+    appId: config.appId || readExport("CODEX_LINK_APP_ID"),
+    appToken: process.env.CODEX_LINK_APP_TOKEN || readExport("CODEX_LINK_APP_TOKEN"),
+    controllerUrl: config.controllerUrl || readExport("CODEX_LINK_CONTROLLER")
+  };
+}
+
+function updateLocalControllerConfig(root, controller, appId, appToken) {
+  const dir = path.join(root, ".codex-link");
+  const configPath = path.join(dir, "config.json");
+  const config = readJsonFile(configPath) || {};
+  writeJsonFile(configPath, {
+    ...config,
+    controllerUrl: controller,
+    appId: appId || config.appId,
+    workerMode: config.workerMode || "workspace",
+    updatedAt: new Date().toISOString()
+  });
+
+  const daemonPath = path.join(dir, "worker-daemon.sh");
+  if (fs.existsSync(daemonPath)) {
+    let daemon = fs.readFileSync(daemonPath, "utf8");
+    daemon = daemon.replace(/^export CODEX_LINK_CONTROLLER=.*$/m, `export CODEX_LINK_CONTROLLER=${shellJsonValue(controller)}`);
+    if (appId) daemon = daemon.replace(/^export CODEX_LINK_APP_ID=.*$/m, `export CODEX_LINK_APP_ID=${shellJsonValue(appId)}`);
+    if (appToken) daemon = daemon.replace(/^export CODEX_LINK_APP_TOKEN=.*$/m, `export CODEX_LINK_APP_TOKEN=${shellJsonValue(appToken)}`);
+    fs.writeFileSync(daemonPath, daemon, "utf8");
+  }
+
+  const workerCommandPath = path.join(dir, "worker-command.sh");
+  if (fs.existsSync(workerCommandPath)) {
+    fs.writeFileSync(workerCommandPath, `CODEX_LINK_CONTROLLER=${controller} CODEX_LINK_APP_ID=${appId} CODEX_LINK_APP_TOKEN=$CODEX_LINK_APP_TOKEN npx --yes github:houseofwealth0/codexlink#main worker\n`, "utf8");
+  }
+}
+
 async function postJson(url, body, headers = {}) {
   const target = new URL(url);
   const data = JSON.stringify(body);
@@ -167,6 +232,59 @@ async function install(args) {
   }
 }
 
+async function reconnect(args) {
+  console.log(`Codex Link reconnect ${CLI_VERSION}`);
+  const controller = args.controller || process.env.CODEX_LINK_CONTROLLER || await ask("New controller URL: ");
+  const root = path.resolve(args.cwd || process.cwd());
+  const credentials = readWorkerCredentials(root);
+  const appId = args["app-id"] || credentials.appId;
+  const appToken = args["app-token"] || credentials.appToken;
+  if (!appId || !appToken) {
+    throw new Error("Could not find existing app id/token. Run this from the paired Replit workspace.");
+  }
+
+  updateLocalControllerConfig(root, controller, appId, appToken);
+  const report = scanEnvironment(root);
+  await postJson(`${controller.replace(/\/$/, "")}/api/reconnect`, { report, controllerUrl: controller }, {
+    "x-codex-link-app-id": appId,
+    "x-codex-link-token": appToken
+  });
+  console.log("Updated local worker controller URL.");
+
+  const daemonPath = path.join(root, ".codex-link", "worker-daemon.sh");
+  if (fs.existsSync(daemonPath)) {
+    const child = spawn("sh", [daemonPath], {
+      cwd: root,
+      env: {
+        ...process.env,
+        CODEX_LINK_CONTROLLER: controller,
+        CODEX_LINK_APP_ID: appId,
+        CODEX_LINK_APP_TOKEN: appToken,
+        CODEX_LINK_WORKER_MODE: "workspace"
+      },
+      stdio: "ignore",
+      detached: true
+    });
+    child.unref();
+    console.log(`Worker daemon restarted with pid ${child.pid}.`);
+  }
+
+  const verify = spawn(process.execPath, [path.join(__dirname, "../../worker/src/worker.js"), "--once"], {
+    cwd: root,
+    env: {
+      ...process.env,
+      CODEX_LINK_CONTROLLER: controller,
+      CODEX_LINK_APP_ID: appId,
+      CODEX_LINK_APP_TOKEN: appToken,
+      CODEX_LINK_WORKER_MODE: "workspace"
+    },
+    stdio: "inherit"
+  });
+  const code = await new Promise((resolve) => verify.on("exit", resolve));
+  if (code !== 0) throw new Error(`Worker verification failed with exit code ${code}`);
+  console.log("Reconnect complete. App should show online shortly.");
+}
+
 async function scan(args) {
   console.log(JSON.stringify(scanEnvironment(path.resolve(args.cwd || process.cwd())), null, 2));
 }
@@ -179,9 +297,10 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0] || "help";
   if (command === "install") return install(args);
+  if (command === "reconnect") return reconnect(args);
   if (command === "scan") return scan(args);
   if (command === "worker") return worker(args);
-  console.log("Usage: codex-link install|scan|worker");
+  console.log("Usage: codex-link install|reconnect|scan|worker");
 }
 
 main().catch((error) => {
