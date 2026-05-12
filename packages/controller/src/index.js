@@ -95,6 +95,11 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
+function redirect(res, location) {
+  res.writeHead(303, { location });
+  res.end();
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -161,6 +166,9 @@ async function htmlPage(req) {
     section { background: #fff; border: 1px solid #dfe3ea; border-radius: 8px; padding: 18px; }
     h2 { margin: 0 0 12px; font-size: 16px; }
     form { display: inline; }
+    .block-form { display: grid; gap: 10px; max-width: 760px; }
+    select, textarea, input { font: inherit; border: 1px solid #cfd6e3; border-radius: 6px; padding: 9px; background: #fff; color: inherit; }
+    textarea { min-height: 92px; resize: vertical; }
     button { border: 0; border-radius: 6px; background: #1f6feb; color: white; padding: 9px 12px; cursor: pointer; font-weight: 600; }
     .danger { background: #b42318; }
     table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -213,12 +221,26 @@ async function htmlPage(req) {
       </table>
     </section>
     <section>
+      <h2>Start Codex Task</h2>
+      ${apps.length ? `<form class="block-form" method="post" action="/tasks">
+        <label>App
+          <select name="appId">
+            ${apps.map((app) => `<option value="${escapeHtml(app.id)}">${escapeHtml(app.name)} (${escapeHtml(app.appType)})</option>`).join("")}
+          </select>
+        </label>
+        <label>Instruction
+          <textarea name="prompt" placeholder="Tell Codex what to inspect or change..."></textarea>
+        </label>
+        <button type="submit">Start Live Task</button>
+      </form>` : "Connect an app before starting a task."}
+    </section>
+    <section>
       <h2>Setup Plans</h2>
       ${plans.slice(0, 8).map((plan) => `<p><span class="pill">${plan.status}</span> <strong>${plan.appName}</strong> ${plan.appType} ${plan.reusedStrategy ? "(reused strategy)" : "(new strategy)"}<br><code>${plan.id}</code></p><pre>${plan.summary}\n\n${plan.actions.map((a) => `${a.risk}: ${a.description} (${a.path})`).join("\n")}</pre>`).join("") || "No setup plans yet."}
     </section>
     <section>
       <h2>Tasks</h2>
-      ${tasks.slice(0, 10).map((task) => `<p><span class="pill">${task.status}</span> <code>${task.id}</code> ${task.prompt}</p><pre>${task.summary || ""}\n${task.diff || ""}</pre>`).join("") || "No tasks yet."}
+      ${tasks.slice(0, 10).map((task) => `<p><span class="pill">${task.status}</span> <a href="/tasks/${task.id}"><code>${task.id}</code></a> ${escapeHtml(task.prompt)}</p><pre>${escapeHtml(task.summary || "")}\n${escapeHtml(task.diff || "")}</pre>`).join("") || "No tasks yet."}
     </section>
     <section>
       <h2>Logs</h2>
@@ -227,6 +249,111 @@ async function htmlPage(req) {
   </main>
 </body>
 </html>`;
+}
+
+function taskPage(taskId) {
+  const task = store.data.tasks[taskId];
+  if (!task) {
+    return `<!doctype html><html><body><h1>Task not found</h1><p><a href="/">Back</a></p></body></html>`;
+  }
+  const app = store.getApp(task.appId);
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codex Link Task</title>
+  <style>
+    body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f8fb; color: #1b1f2a; }
+    header { padding: 24px; background: #fff; border-bottom: 1px solid #dfe3ea; }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
+    section { background: #fff; border: 1px solid #dfe3ea; border-radius: 8px; padding: 18px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #101319; color: #eef2f7; padding: 14px; border-radius: 8px; min-height: 320px; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #eef2ff; color: #243b7a; }
+    button { border: 0; border-radius: 6px; background: #1f6feb; color: white; padding: 9px 12px; cursor: pointer; font-weight: 600; }
+    .danger { background: #b42318; }
+  </style>
+</head>
+<body>
+  <header>
+    <p><a href="/">Back to dashboard</a></p>
+    <h1>Live Task</h1>
+    <p><span id="status" class="pill">${escapeHtml(task.status)}</span> <code>${escapeHtml(task.id)}</code></p>
+    <p><strong>${escapeHtml(app?.name || "Unknown app")}</strong>: ${escapeHtml(task.prompt)}</p>
+  </header>
+  <main>
+    <section>
+      <h2>Live Run</h2>
+      <pre id="events"></pre>
+    </section>
+    <section>
+      <h2>Controls</h2>
+      <form method="post" action="/tasks/${escapeHtml(task.id)}/queue-command">
+        <input type="hidden" name="command" value="git" />
+        <input type="hidden" name="args" value="status --short" />
+        <button type="submit">Queue git status</button>
+      </form>
+      <form method="post" action="/tasks/${escapeHtml(task.id)}/stop" style="display:inline">
+        <button class="danger" type="submit">Stop Task</button>
+      </form>
+    </section>
+  </main>
+  <script>
+    const out = document.getElementById('events');
+    const status = document.getElementById('status');
+    function line(event) {
+      const when = new Date(event.createdAt).toLocaleTimeString();
+      return '[' + when + '] ' + event.type + ': ' + event.message + '\\n';
+    }
+    const source = new EventSource('/tasks/${escapeHtml(task.id)}/events');
+    source.onmessage = (message) => {
+      const payload = JSON.parse(message.data);
+      if (payload.task?.status) status.textContent = payload.task.status;
+      for (const event of payload.events || []) out.textContent += line(event);
+      out.scrollTop = out.scrollHeight;
+    };
+  </script>
+</body>
+</html>`;
+}
+
+function parseForm(body) {
+  const params = new URLSearchParams(body);
+  return Object.fromEntries(params.entries());
+}
+
+async function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 2_000_000) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => resolve(body));
+  });
+}
+
+function taskSse(req, res, taskId) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive"
+  });
+  let lastIndex = 0;
+  const send = () => {
+    const events = store.listTaskEvents(taskId);
+    const nextEvents = events.slice(lastIndex);
+    lastIndex = events.length;
+    const task = store.data.tasks[taskId] || null;
+    res.write(`data: ${JSON.stringify({ task, events: nextEvents })}\n\n`);
+  };
+  send();
+  const interval = setInterval(send, 1500);
+  req.on("close", () => clearInterval(interval));
 }
 
 async function handleApi(req, res, url) {
@@ -267,6 +394,51 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/tasks") {
+    const form = parseForm(await readRawBody(req));
+    const app = store.getApp(form.appId);
+    if (!app || !form.prompt?.trim()) return sendJson(res, 400, { error: "App and prompt are required." });
+    const task = store.createTask({ appId: app.id, prompt: form.prompt.trim() });
+    store.updateTask(task.id, { status: "running", summary: "Waiting for worker heartbeat." });
+    store.addTaskEvent(task.id, "task", `Task started for ${app.name}.`);
+    store.enqueueWorkerCommand(app.id, {
+      taskId: task.id,
+      type: "run_command",
+      command: "git",
+      args: ["status", "--short"]
+    });
+    store.addTaskEvent(task.id, "worker", "Queued initial git status command.");
+    return redirect(res, `/tasks/${task.id}`);
+  }
+
+  const taskMatch = url.pathname.match(/^\/tasks\/([^/]+)$/);
+  if (req.method === "GET" && taskMatch) {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(taskPage(taskMatch[1]));
+    return;
+  }
+
+  const taskEventsMatch = url.pathname.match(/^\/tasks\/([^/]+)\/events$/);
+  if (req.method === "GET" && taskEventsMatch) return taskSse(req, res, taskEventsMatch[1]);
+
+  const queueCommandMatch = url.pathname.match(/^\/tasks\/([^/]+)\/queue-command$/);
+  if (req.method === "POST" && queueCommandMatch) {
+    const task = store.data.tasks[queueCommandMatch[1]];
+    if (!task) return sendJson(res, 404, { error: "Task not found." });
+    const form = parseForm(await readRawBody(req));
+    const args = String(form.args || "").split(/\s+/).filter(Boolean);
+    store.enqueueWorkerCommand(task.appId, { taskId: task.id, type: "run_command", command: form.command || "git", args });
+    store.addTaskEvent(task.id, "worker", `Queued command: ${form.command || "git"} ${args.join(" ")}`);
+    return redirect(res, `/tasks/${task.id}`);
+  }
+
+  const stopTaskMatch = url.pathname.match(/^\/tasks\/([^/]+)\/stop$/);
+  if (req.method === "POST" && stopTaskMatch) {
+    store.updateTask(stopTaskMatch[1], { status: "stopped", summary: "Stopped by user." });
+    store.addTaskEvent(stopTaskMatch[1], "task", "Task stopped by user.");
+    return redirect(res, `/tasks/${stopTaskMatch[1]}`);
+  }
+
   if (req.method === "POST" && url.pathname === "/api/pair") {
     const body = await readBody(req);
     const pairing = store.consumePairingCode(body.pairingCode);
@@ -301,7 +473,30 @@ async function handleApi(req, res, url) {
       lastHeartbeatAt: new Date().toISOString(),
       lastWorker: body
     });
-    return sendJson(res, 200, { ok: true, commands: [] });
+    const commands = store.takeWorkerCommands(app.id);
+    for (const command of commands) {
+      if (command.taskId) {
+        store.addTaskEvent(command.taskId, "worker", `Sent worker command: ${command.type}`, { commandId: command.id });
+      }
+    }
+    return sendJson(res, 200, { ok: true, commands });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/command-results") {
+    const app = authenticate(req);
+    if (!app) return sendJson(res, 401, { error: "Unauthorized" });
+    const body = await readBody(req);
+    for (const item of body.results || []) {
+      const command = store.completeWorkerCommand(app.id, item.commandId, item.result);
+      if (command?.taskId) {
+        const output = [item.result?.stdout, item.result?.stderr, item.result?.error].filter(Boolean).join("\n").trim();
+        store.addTaskEvent(command.taskId, item.result?.ok === false ? "worker_error" : "worker_result", output || `Worker command ${command.type} completed.`, {
+          commandId: command.id,
+          result: item.result
+        });
+      }
+    }
+    return sendJson(res, 200, { ok: true });
   }
 
   if (req.method === "POST" && url.pathname === "/api/setup-result") {
@@ -329,7 +524,7 @@ const server = http.createServer(async (req, res) => {
       res.end(await htmlPage(req));
       return;
     }
-    if (url.pathname.startsWith("/api/") || url.pathname === "/pairing-code" || url.pathname === "/shutdown") return await handleApi(req, res, url);
+    if (url.pathname.startsWith("/api/") || url.pathname === "/pairing-code" || url.pathname === "/shutdown" || url.pathname.startsWith("/tasks")) return await handleApi(req, res, url);
     sendJson(res, 404, { error: "Not found" });
   } catch (error) {
     sendJson(res, 500, { error: error.message });

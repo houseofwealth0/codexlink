@@ -22,6 +22,8 @@ class Store {
       setupPlans: {},
       setupStrategies: {},
       tasks: {},
+      taskEvents: {},
+      workerCommands: {},
       logs: []
     });
   }
@@ -151,9 +153,12 @@ class Store {
       branch: `codex/task-${id.slice(0, 8)}`,
       summary: null,
       diff: null,
+      events: [],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
+    this.data.taskEvents[id] = [];
+    this.addTaskEvent(id, "task", "Task queued.", { appId });
     this.save();
     return this.data.tasks[id];
   }
@@ -164,6 +169,67 @@ class Store {
     Object.assign(task, patch, { updatedAt: new Date().toISOString() });
     this.save();
     return task;
+  }
+
+  addTaskEvent(taskId, type, message, meta = {}) {
+    if (!this.data.taskEvents[taskId]) this.data.taskEvents[taskId] = [];
+    const event = {
+      id: crypto.randomUUID(),
+      taskId,
+      type,
+      message,
+      meta,
+      createdAt: new Date().toISOString()
+    };
+    this.data.taskEvents[taskId].push(event);
+    this.data.taskEvents[taskId] = this.data.taskEvents[taskId].slice(-500);
+    const task = this.data.tasks[taskId];
+    if (task) {
+      task.events = this.data.taskEvents[taskId].slice(-50);
+      task.updatedAt = new Date().toISOString();
+    }
+    this.save();
+    return event;
+  }
+
+  listTaskEvents(taskId) {
+    return this.data.taskEvents[taskId] || [];
+  }
+
+  enqueueWorkerCommand(appId, command) {
+    if (!this.data.workerCommands[appId]) this.data.workerCommands[appId] = [];
+    const queued = {
+      id: crypto.randomUUID(),
+      appId,
+      status: "queued",
+      createdAt: new Date().toISOString(),
+      ...command
+    };
+    this.data.workerCommands[appId].push(queued);
+    this.save();
+    return queued;
+  }
+
+  takeWorkerCommands(appId) {
+    const commands = this.data.workerCommands[appId] || [];
+    const queued = commands.filter((command) => command.status === "queued");
+    for (const command of queued) {
+      command.status = "sent";
+      command.sentAt = new Date().toISOString();
+    }
+    this.save();
+    return queued;
+  }
+
+  completeWorkerCommand(appId, commandId, result) {
+    const commands = this.data.workerCommands[appId] || [];
+    const command = commands.find((candidate) => candidate.id === commandId);
+    if (!command) return null;
+    command.status = result?.ok === false ? "failed" : "completed";
+    command.result = result;
+    command.completedAt = new Date().toISOString();
+    this.save();
+    return command;
   }
 
   listApps() {

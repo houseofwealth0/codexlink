@@ -84,8 +84,16 @@ async function heartbeat() {
     "x-codex-link-app-id": appId,
     "x-codex-link-token": token
   });
+  const results = [];
   for (const command of response.commands || []) {
-    await handleCommand(command, root);
+    const result = await handleCommand(command, root);
+    results.push({ commandId: command.id, result });
+  }
+  if (results.length) {
+    await postJson(`${controller.replace(/\/$/, "")}/api/command-results`, { results }, {
+      "x-codex-link-app-id": appId,
+      "x-codex-link-token": token
+    });
   }
 }
 
