@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 const readline = require("readline");
+const fs = require("fs");
 const { spawn } = require("child_process");
 const http = require("http");
 const https = require("https");
@@ -125,7 +126,7 @@ async function install(args) {
   for (const result of results) {
     console.log(`- ${result.path}${result.backup ? ` (backup: ${result.backup})` : ""}`);
   }
-  console.log("\nApp connected. Starting worker once for verification...");
+  console.log("\nApp connected. Starting persistent worker daemon...");
 
   const env = {
     ...process.env,
@@ -134,12 +135,33 @@ async function install(args) {
     CODEX_LINK_APP_TOKEN: pair.app.token,
     CODEX_LINK_WORKER_MODE: "workspace"
   };
-  const child = spawn(process.execPath, [path.join(__dirname, "../../worker/src/worker.js"), "--once"], {
+
+  const daemonPath = path.join(root, ".codex-link", "worker-daemon.sh");
+  if (fs.existsSync(daemonPath)) {
+    const child = spawn("sh", [daemonPath], {
+      cwd: root,
+      env,
+      stdio: "ignore",
+      detached: true
+    });
+    child.unref();
+    console.log(`Worker daemon started with pid ${child.pid}.`);
+  } else {
+    console.log("Worker daemon script was not found; starting one-time verification only.");
+  }
+
+  console.log("Verifying worker heartbeat...");
+  const verify = spawn(process.execPath, [path.join(__dirname, "../../worker/src/worker.js"), "--once"], {
     cwd: root,
     env,
     stdio: "inherit"
   });
-  await new Promise((resolve) => child.on("exit", resolve));
+  const code = await new Promise((resolve) => verify.on("exit", resolve));
+  if (code === 0) {
+    console.log("App should remain online while the Replit workspace keeps the worker daemon running.");
+  } else {
+    throw new Error(`Worker verification failed with exit code ${code}`);
+  }
 }
 
 async function scan(args) {

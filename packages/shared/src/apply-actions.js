@@ -51,6 +51,20 @@ function applyAction(root, action) {
     return { actionId: action.id, path: action.path, backup, applied: true };
   }
 
+  if (action.type === "patch_text") {
+    const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, "utf8") : "";
+    let next = existing;
+    if (action.find && existing.includes(action.find)) {
+      next = existing.replace(action.find, action.replace);
+    } else if (action.append) {
+      next = `${existing}${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}${action.append}`;
+    } else {
+      throw new Error(`patch_text action ${action.id} did not match and has no append fallback`);
+    }
+    fs.writeFileSync(fullPath, next, "utf8");
+    return { actionId: action.id, path: action.path, backup, applied: true };
+  }
+
   throw new Error(`Unsupported setup action type: ${action.type}`);
 }
 

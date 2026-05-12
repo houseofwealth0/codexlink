@@ -12,7 +12,45 @@ function stablePattern(report) {
 }
 
 function workerCommand(controllerUrl, appId, appToken) {
-  return `CODEX_LINK_CONTROLLER=${controllerUrl} CODEX_LINK_APP_ID=${appId} CODEX_LINK_APP_TOKEN=${appToken} npx codex-link worker`;
+  return `CODEX_LINK_CONTROLLER=${controllerUrl} CODEX_LINK_APP_ID=${appId} CODEX_LINK_APP_TOKEN=${appToken} npx --yes github:houseofwealth0/codexlink#main worker`;
+}
+
+function persistentWorkerScript(controllerUrl, appId, appToken) {
+  return [
+    "#!/usr/bin/env sh",
+    "set -eu",
+    `export CODEX_LINK_CONTROLLER=${JSON.stringify(controllerUrl)}`,
+    `export CODEX_LINK_APP_ID=${JSON.stringify(appId)}`,
+    `export CODEX_LINK_APP_TOKEN=${JSON.stringify(appToken)}`,
+    "export CODEX_LINK_WORKER_MODE=workspace",
+    "mkdir -p .codex-link",
+    "while true; do",
+    "  if command -v codex-link >/dev/null 2>&1; then",
+    "    codex-link worker >> .codex-link/worker.log 2>&1 || true",
+    "  else",
+    "    npx --yes github:houseofwealth0/codexlink#main worker >> .codex-link/worker.log 2>&1 || true",
+    "  fi",
+    "  sleep 5",
+    "done",
+    ""
+  ].join("\n");
+}
+
+function nodeSidecarScript() {
+  return [
+    "const { spawn } = require('child_process');",
+    "",
+    "const shell = process.platform === 'win32' ? 'cmd' : 'sh';",
+    "const shellArgs = process.platform === 'win32' ? ['/d', '/s', '/c'] : ['-lc'];",
+    "const child = spawn(shell, [...shellArgs, 'sh .codex-link/worker-daemon.sh'], {",
+    "  cwd: process.cwd(),",
+    "  env: process.env,",
+    "  stdio: 'ignore',",
+    "  detached: true",
+    "});",
+    "child.unref();",
+    ""
+  ].join("\n");
 }
 
 function packageJsonAction(report) {
@@ -42,7 +80,7 @@ function packageJsonAction(report) {
         "",
         "const shell = process.platform === 'win32' ? 'cmd' : 'sh';",
         "const shellArgs = process.platform === 'win32' ? ['/d', '/s', '/c'] : ['-lc'];",
-        "const worker = spawn(shell, [...shellArgs, 'npx codex-link worker'], {",
+        "const worker = spawn(shell, [...shellArgs, 'sh .codex-link/worker-daemon.sh'], {",
         "  cwd: process.cwd(), env: process.env, stdio: 'ignore', detached: true",
         "});",
         "worker.unref();",
@@ -76,16 +114,16 @@ function packageJsonAction(report) {
 
 function replitAction(report) {
   if (!report.files?.hasReplit) {
-    return {
+    return [{
       id: "create-replit-helper",
       risk: "startup",
       type: "write_file",
       path: ".codex-link/replit-run-note.txt",
-      content: "Codex Link is paired. Add `codex-link worker` to your Replit startup command if automatic reconnect does not start.\n",
+      content: "Codex Link is paired. Add `sh .codex-link/worker-daemon.sh` to your Replit startup command if automatic reconnect does not start.\n",
       description: "Write a fallback note because no .replit file was detected."
-    };
+    }];
   }
-  return {
+  const actions = [{
     id: "write-replit-autostart-note",
     risk: "startup",
     type: "write_file",
@@ -94,11 +132,22 @@ function replitAction(report) {
       "# Codex Link Autostart",
       "",
       "This app has a .replit file. The installer keeps the app run command intact and adds helper scripts/config.",
-      "If the worker does not reconnect after workspace restart, run `npx codex-link worker` or wire that command into the app's startup flow.",
+      "The installer adds an onBoot entry when possible so `sh .codex-link/worker-daemon.sh` starts with the workspace.",
+      "If the worker does not reconnect after workspace restart, run `sh .codex-link/worker-daemon.sh` in a Shell.",
       ""
     ].join("\n"),
     description: "Record app-specific autostart guidance without changing the main run command."
-  };
+  }];
+
+  actions.push({
+    id: "patch-replit-onboot",
+    risk: "startup",
+    type: "patch_text",
+    path: ".replit",
+    append: '\nonBoot = "sh .codex-link/worker-daemon.sh > .codex-link/onboot.log 2>&1 &"\n',
+    description: "Add a Replit onBoot hook that starts the Codex Link worker daemon."
+  });
+  return actions;
 }
 
 function createSetupPlan({ report, controllerUrl, appId, appToken, rememberedStrategy }) {
@@ -139,12 +188,29 @@ function createSetupPlan({ report, controllerUrl, appId, appToken, rememberedStr
       content: `${workerCommand(controllerUrl, appId, "$CODEX_LINK_APP_TOKEN")}\n`,
       executable: true,
       description: "Write a helper command that starts the worker."
+    },
+    {
+      id: "write-worker-daemon",
+      risk: "safe",
+      type: "write_file",
+      path: ".codex-link/worker-daemon.sh",
+      content: persistentWorkerScript(controllerUrl, appId, appToken),
+      executable: true,
+      description: "Write a persistent worker daemon that reconnects after failures."
+    },
+    {
+      id: "write-worker-sidecar",
+      risk: "safe",
+      type: "write_file",
+      path: ".codex-link/start-worker-sidecar.cjs",
+      content: nodeSidecarScript(),
+      description: "Write a Node sidecar launcher for environments that start npm scripts."
     }
   ];
 
   const pkgActions = packageJsonAction(report);
   if (pkgActions) actions.push(...pkgActions);
-  actions.push(replitAction(report));
+  actions.push(...replitAction(report));
 
   return {
     id: crypto.randomUUID(),

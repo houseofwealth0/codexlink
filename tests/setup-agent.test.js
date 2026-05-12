@@ -29,7 +29,9 @@ test("creates a setup plan with safe config and startup actions", () => {
   assert.equal(plan.appName, "sample");
   assert.equal(plan.recommendedMode, "safe");
   assert.ok(plan.actions.some((action) => action.id === "write-config" && action.risk === "safe"));
+  assert.ok(plan.actions.some((action) => action.id === "write-worker-daemon" && action.risk === "safe"));
   assert.ok(plan.actions.some((action) => action.id === "patch-package-json" && action.risk === "startup"));
+  assert.ok(plan.actions.some((action) => action.id === "patch-replit-onboot" && action.risk === "startup"));
 });
 
 test("safe mode splits low-risk and approval-required actions", () => {

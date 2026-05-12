@@ -34,3 +34,21 @@ test("writes files and json with backups for existing files", () => {
   assert.ok(results[0].backup);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, ".codex-link/config.json"), "utf8")).appId, "app-1");
 });
+
+test("patches text files with append fallback", () => {
+  const root = tempDir();
+  fs.writeFileSync(path.join(root, ".replit"), 'run = "npm start"\n');
+
+  applyActions(root, [
+    {
+      id: "patch-replit-onboot",
+      type: "patch_text",
+      path: ".replit",
+      append: 'onBoot = "sh .codex-link/worker-daemon.sh > .codex-link/onboot.log 2>&1 &"\n'
+    }
+  ]);
+
+  const replit = fs.readFileSync(path.join(root, ".replit"), "utf8");
+  assert.match(replit, /run = "npm start"/);
+  assert.match(replit, /onBoot =/);
+});
