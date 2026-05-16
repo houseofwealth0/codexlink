@@ -26,26 +26,73 @@ function readJson(root, file) {
   }
 }
 
+function execGit(root, args) {
+  return execFileSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"]
+  }).trim();
+}
+
+function isReplitInternalRemote(url) {
+  return /^git:\/\/gitsafe[:/]/i.test(url)
+    || /^git\+ssh:\/\/git@ssh\.worf\.replit\.dev[:/]/i.test(url)
+    || /^ssh:\/\/git@ssh\.worf\.replit\.dev[:/]/i.test(url);
+}
+
+function parseRemotes(text) {
+  const byName = new Map();
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const match = line.trim().match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)$/);
+    if (!match) continue;
+    const [, name, url, direction] = match;
+    const record = byName.get(name) || { name, fetchUrl: null, pushUrl: null, internal: false };
+    if (direction === "fetch") record.fetchUrl = url;
+    if (direction === "push") record.pushUrl = url;
+    record.internal = record.internal || isReplitInternalRemote(url);
+    byName.set(name, record);
+  }
+  return Array.from(byName.values()).map((remote) => ({
+    ...remote,
+    url: remote.fetchUrl || remote.pushUrl,
+    internal: remote.internal || isReplitInternalRemote(remote.fetchUrl || remote.pushUrl || "")
+  }));
+}
+
+function chooseExternalRemote(remotes) {
+  const external = remotes.filter((remote) => remote.url && !remote.internal);
+  return external.find((remote) => remote.name === "origin") || external[0] || null;
+}
+
 function gitInfo(root) {
   try {
-    const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
-    const remote = execFileSync("git", ["remote", "get-url", "origin"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim();
-    const dirty = execFileSync("git", ["status", "--porcelain"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
-    }).trim().length > 0;
-    return { present: true, branch, remote, dirty };
+    const branch = execGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    const remotes = parseRemotes(execGit(root, ["remote", "-v"]));
+    const externalRemote = chooseExternalRemote(remotes);
+    const dirty = execGit(root, ["status", "--porcelain"]).length > 0;
+    return {
+      present: true,
+      branch,
+      remote: externalRemote?.url || null,
+      remoteName: externalRemote?.name || null,
+      externalRemote,
+      remotes,
+      hasInternalReplitRemote: remotes.some((remote) => remote.internal),
+      hasExternalRemote: Boolean(externalRemote),
+      dirty
+    };
   } catch {
-    return { present: exists(root, ".git"), branch: null, remote: null, dirty: null };
+    return {
+      present: exists(root, ".git"),
+      branch: null,
+      remote: null,
+      remoteName: null,
+      externalRemote: null,
+      remotes: [],
+      hasInternalReplitRemote: false,
+      hasExternalRemote: false,
+      dirty: null
+    };
   }
 }
 
@@ -128,4 +175,4 @@ function scanEnvironment(root = process.cwd()) {
   return report;
 }
 
-module.exports = { scanEnvironment, readText, readJson };
+module.exports = { scanEnvironment, readText, readJson, gitInfo, parseRemotes, isReplitInternalRemote };

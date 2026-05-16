@@ -146,8 +146,18 @@ function startWorkspaceClone(appId) {
   if (!app) return { ok: false, error: "Workspace not found." };
   if (activeCloneProcesses.has(appId)) return { ok: true, running: true };
 
-  const remote = app.git?.remote || app.lastReport?.git?.remote;
+  const remote = app.git?.externalRemote?.url || app.git?.remote || app.lastReport?.git?.externalRemote?.url || app.lastReport?.git?.remote;
   if (!remote) {
+    if (app.git?.hasInternalReplitRemote || app.lastReport?.git?.hasInternalReplitRemote) {
+      updateCloneStatus(appId, {
+        status: "external_remote_needed",
+        remote: null,
+        path: null,
+        message: "Replit internal Git detected. Add an external Git remote for controller sync."
+      });
+      store.addWorkspaceTranscript(appId, "clone", "Automatic clone paused: Replit internal Git is present, but no external clone remote was found.");
+      return { ok: false, error: "External Git remote needed." };
+    }
     updateCloneStatus(appId, {
       status: "skipped",
       remote: null,
@@ -449,7 +459,7 @@ async function htmlPage(req) {
             const replit = report.replit || {};
             const git = app.git || {};
             const clone = app.cloneStatus || {};
-            const cloneClass = clone.status === "ready" ? "online" : clone.status === "failed" ? "offline" : "";
+            const cloneClass = clone.status === "ready" ? "online" : ["failed", "external_remote_needed"].includes(clone.status) ? "offline" : "";
             const reconnectNeeded = needsWorkerReconnect(app, publicTunnelUrl);
             const tags = (app.tags || []).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
             return `<a class="workspace-card" href="/workspaces/${escapeHtml(app.id)}">
@@ -464,7 +474,7 @@ async function htmlPage(req) {
                 <div class="muted">${escapeHtml(app.appType || "unknown")} - ${escapeHtml(app.packageManager || "unknown package manager")}</div>
               </div>
               <div>
-                <strong>${git.present ? "Git connected" : "Git missing"}</strong>
+                <strong>${git.hasExternalRemote ? "External Git connected" : git.hasInternalReplitRemote ? "Replit internal Git" : git.present ? "Git present" : "Git missing"}</strong>
                 <div class="muted"><code>${escapeHtml(git.branch || "no branch")}</code></div>
                 <div class="muted"><code>${escapeHtml(git.remote || "no remote")}</code></div>
               </div>
@@ -574,7 +584,7 @@ async function workspacePage(appId, req) {
   const git = app.git || {};
   const clone = app.cloneStatus || {};
   const pathStatus = validateLocalPath(app.localPath);
-  const cloneClass = clone.status === "ready" ? "online" : clone.status === "failed" ? "offline" : "";
+  const cloneClass = clone.status === "ready" ? "online" : ["failed", "external_remote_needed"].includes(clone.status) ? "offline" : "";
   const publicControllerUrl = await installBaseUrl(req);
   const reconnectNeeded = needsWorkerReconnect(app, publicControllerUrl);
   const reconnectCommand = workerReconnectCommand(app, publicControllerUrl);
@@ -702,7 +712,7 @@ async function workspacePage(appId, req) {
         <div class="meta">
           <div><strong>Replit</strong><br><code>${escapeHtml(replit.owner || "unknown")}/${escapeHtml(replit.slug || app.name || "unknown")}</code></div>
           <div><strong>Type</strong><br>${escapeHtml(app.appType || "unknown")} - ${escapeHtml(app.packageManager || "unknown")}</div>
-          <div><strong>Git</strong><br>${git.present ? "present" : "missing"} - <code>${escapeHtml(git.branch || "no branch")}</code><br><code>${escapeHtml(git.remote || "no remote")}</code></div>
+          <div><strong>Git</strong><br>${git.hasExternalRemote ? "external remote ready" : git.hasInternalReplitRemote ? "Replit internal Git only" : git.present ? "present without external remote" : "missing"} - <code>${escapeHtml(git.branch || "no branch")}</code><br><code>${escapeHtml(git.remote || "no external remote")}</code></div>
           <div><strong>Last heartbeat</strong><br>${escapeHtml(app.lastHeartbeatAt || "never")}</div>
           <div><strong>Worker mode</strong><br>${escapeHtml(app.workerMode || "workspace")}</div>
         </div>

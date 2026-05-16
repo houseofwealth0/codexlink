@@ -225,7 +225,11 @@ function createSetupPlan({ report, controllerUrl, appId, appToken, rememberedStr
     summary: `Detected ${report.appType} app using ${report.packageManager}. Configure Codex Link workspace worker with guarded startup integration.`,
     actions,
     warnings: [
-      report.git?.present ? null : "No Git repository detected. Branch + approve coding tasks will need a durable Git remote before they are fully safe.",
+      report.git?.hasExternalRemote ? null : report.git?.hasInternalReplitRemote
+        ? "Replit internal Git was detected, but no external Git remote was found. Controller sync needs a cloneable remote such as GitHub."
+        : report.git?.present
+          ? "Git repository detected, but no external Git remote was found. Controller sync needs a cloneable remote such as GitHub."
+          : "No Git repository detected. Branch + approve coding tasks will need a durable Git remote before they are fully safe.",
       report.git?.dirty ? "Git working tree appears dirty. Review before running coding tasks." : null
     ].filter(Boolean),
     createdAt: new Date().toISOString()
