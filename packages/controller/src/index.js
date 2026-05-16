@@ -185,6 +185,13 @@ function safeSegment(value) {
     .slice(0, 48) || "workspace";
 }
 
+function hasInternalReplitGit(app) {
+  return Boolean(app?.git?.hasInternalReplitRemote
+    || app?.lastReport?.git?.hasInternalReplitRemote
+    || (app?.git?.remotes || []).some((remote) => remote.internal)
+    || (app?.lastReport?.git?.remotes || []).some((remote) => remote.internal));
+}
+
 function defaultWorkspacePath(app) {
   const report = app.lastReport || {};
   const replit = report.replit || {};
@@ -368,7 +375,7 @@ function startWorkspaceClone(appId) {
 
   const remote = app.git?.externalRemote?.url || app.git?.remote || app.lastReport?.git?.externalRemote?.url || app.lastReport?.git?.remote;
   if (!remote) {
-    if (app.git?.hasInternalReplitRemote || app.lastReport?.git?.hasInternalReplitRemote) {
+    if (hasInternalReplitGit(app)) {
       updateCloneStatus(appId, {
         status: "external_remote_needed",
         remote: null,
@@ -384,7 +391,7 @@ function startWorkspaceClone(appId) {
       path: null,
       message: "No Git remote detected; automatic clone is unavailable."
     });
-    store.addWorkspaceTranscript(appId, "clone", "Automatic clone skipped: no Git remote detected.");
+    store.addWorkspaceTranscript(appId, "git-sync", "Waiting for GitHub Sync to create a controller-ready remote.");
     return { ok: false, error: "No Git remote detected." };
   }
 
@@ -819,7 +826,7 @@ async function workspacePage(appId, req) {
   const tags = (app.tags || []).join(", ");
   const notes = app.notes || "";
   const localPath = app.localPath || "";
-  const autoSyncAvailable = Boolean(git.hasInternalReplitRemote || gitSync.status === "internal_git_detected" || gitSync.status === "failed" || gitSync.status === "github_login_started");
+  const autoSyncAvailable = Boolean(hasInternalReplitGit(app) || gitSync.status === "internal_git_detected" || gitSync.status === "failed" || gitSync.status === "github_login_started");
   const promptDisabled = pathStatus.ok ? "" : "disabled";
   const promptHint = pathStatus.ok
     ? `Codex will run locally in ${pathStatus.path}`
@@ -919,7 +926,7 @@ async function workspacePage(appId, req) {
     </section>
     <aside class="side">
       ${reconnectNeeded && reconnectCommand ? `<section class="warning"><h2>Worker Reconnect Needed</h2><p>This workspace was installed with an older public tunnel URL. Run this once in that Replit workspace to update the existing worker without creating a duplicate app.</p><pre>${escapeHtml(reconnectCommand)}</pre></section>` : ""}
-      ${pathStatus.ok ? "" : autoSyncAvailable ? `<section class="warning"><h2>GitHub Sync Needed</h2><p>This Replit workspace has internal Git, so Codex Link needs to create a private GitHub remote before it can clone the project locally. Use the GitHub Sync panel below; you should not have to pick a folder manually.</p></section>` : `<section class="warning"><h2>Local Checkout Needed</h2><p>Codex needs a local checkout on this PC. If this project has a Git remote, use Clone / Retry Local Checkout. Otherwise set a local path manually.</p></section>`}
+      ${pathStatus.ok ? "" : autoSyncAvailable ? `<section class="warning"><h2>GitHub Sync Needed</h2><p>This Replit workspace has internal Git. Codex Link will create a private GitHub remote, push the Replit project, and prepare the controller workspace automatically.</p></section>` : `<section class="warning"><h2>GitHub Remote Needed</h2><p>Codex Link needs a controller-ready Git remote before Codex can run against this project.</p></section>`}
       <section>
         <h2>GitHub Sync</h2>
         <div class="meta">
@@ -938,15 +945,13 @@ async function workspacePage(appId, req) {
         </form>
       </section>
       <section>
-        <h2>Local Checkout</h2>
+        <h2>Controller Workspace</h2>
         <div class="meta">
           <div><strong>Status</strong><br><span id="clone-message">${escapeHtml(clone.message || "No clone status yet.")}</span></div>
           <div><strong>Remote</strong><br><code>${escapeHtml(clone.remote || git.remote || "no remote detected")}</code></div>
           <div><strong>Path</strong><br><code id="clone-path">${escapeHtml(clone.path || app.localPath || "not ready yet")}</code></div>
         </div>
-        <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/clone">
-          <button type="submit">Clone / Retry Local Checkout</button>
-        </form>
+        ${autoSyncAvailable && !pathStatus.ok ? "" : `<form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/clone"><button type="submit">Prepare Controller Workspace</button></form>`}
       </section>
       <section>
         <h2>Workspace Settings</h2>
@@ -957,7 +962,7 @@ async function workspacePage(appId, req) {
           <label>Tags
             <input name="tags" value="${escapeHtml(tags)}" placeholder="client, production, node" />
           </label>
-          <label>Local Path
+          <label>Advanced: Controller Path
             <input name="localPath" value="${escapeHtml(localPath)}" placeholder="D:\\Users\\colan\\Documents\\my-app" />
           </label>
           <label>Notes

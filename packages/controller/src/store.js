@@ -11,6 +11,26 @@ function readJson(filePath, fallback) {
   }
 }
 
+function isReplitInternalRemoteUrl(url) {
+  return /^git:\/\/gitsafe[:/]/i.test(String(url || ""))
+    || /^git\+ssh:\/\/git@ssh\.worf\.replit\.dev[:/]/i.test(String(url || ""))
+    || /^ssh:\/\/git@ssh\.worf\.replit\.dev[:/]/i.test(String(url || ""))
+    || /^git@ssh\.worf\.replit\.dev:/i.test(String(url || ""));
+}
+
+function hasInternalReplitGit(app) {
+  const gitCandidates = [app.git, app.lastReport?.git].filter(Boolean);
+  return gitCandidates.some((git) => {
+    if (git.hasInternalReplitRemote) return true;
+    return (git.remotes || []).some((remote) => remote.internal || isReplitInternalRemoteUrl(remote.url || remote.fetchUrl || remote.pushUrl));
+  });
+}
+
+function hasExternalGit(app) {
+  const gitCandidates = [app.git, app.lastReport?.git].filter(Boolean);
+  return gitCandidates.some((git) => Boolean(git.hasExternalRemote || git.externalRemote || git.remote));
+}
+
 class Store {
   constructor(dataDir) {
     this.dataDir = dataDir;
@@ -37,6 +57,16 @@ class Store {
     this.data.workerCommands ||= {};
     this.data.logs ||= [];
     for (const app of Object.values(this.data.apps)) {
+      const internalReplitGit = hasInternalReplitGit(app);
+      const externalGit = hasExternalGit(app);
+      if (internalReplitGit && !app.git?.hasInternalReplitRemote) {
+        app.git = {
+          ...(app.lastReport?.git || {}),
+          ...(app.git || {}),
+          hasInternalReplitRemote: true,
+          hasExternalRemote: externalGit
+        };
+      }
       app.displayName ||= app.lastReport?.replit?.slug || app.lastReport?.package?.name || app.name;
       app.tags ||= [];
       app.notes ||= "";
@@ -46,7 +76,7 @@ class Store {
         : app.git?.hasInternalReplitRemote
           ? { status: "external_remote_needed", remote: null, path: null, message: "Replit internal Git detected. Add an external Git remote for controller sync." }
         : { status: "skipped", remote: null, path: null, message: "No Git remote detected." };
-      if (!app.git?.hasExternalRemote && app.git?.hasInternalReplitRemote && ["skipped", "failed"].includes(app.cloneStatus.status)) {
+      if (!externalGit && internalReplitGit && ["skipped", "failed"].includes(app.cloneStatus.status)) {
         app.cloneStatus = {
           ...app.cloneStatus,
           status: "external_remote_needed",
@@ -55,7 +85,7 @@ class Store {
           message: "Replit internal Git detected. Use GitHub Sync to create an external remote."
         };
       }
-      if (!app.git?.hasExternalRemote && app.git?.hasInternalReplitRemote) {
+      if (!externalGit && internalReplitGit) {
         const session = this.data.workspaceSessions[app.id];
         if (session?.transcript?.length) {
           session.transcript = session.transcript.filter((event) => {
@@ -64,14 +94,23 @@ class Store {
         }
       }
       app.gitSync ||= {
-        status: app.git?.hasExternalRemote ? "ready" : app.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
-        message: app.git?.hasExternalRemote ? "External Git remote is configured." : app.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",
+        status: externalGit ? "ready" : internalReplitGit ? "internal_git_detected" : "not_available",
+        message: externalGit ? "External Git remote is configured." : internalReplitGit ? "Replit internal Git detected." : "No Git repository detected.",
         remoteName: "codexlink",
         updatedAt: new Date().toISOString(),
         history: []
       };
       app.gitSync.history ||= [];
+      if (!externalGit && internalReplitGit && ["not_available", "failed"].includes(app.gitSync.status)) {
+        app.gitSync = {
+          ...app.gitSync,
+          status: "internal_git_detected",
+          message: "Replit internal Git detected. Use GitHub Sync to create the external GitHub remote.",
+          updatedAt: new Date().toISOString()
+        };
+      }
     }
+    this.save();
   }
 
   save() {

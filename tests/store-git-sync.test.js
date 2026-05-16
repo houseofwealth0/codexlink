@@ -65,3 +65,42 @@ test("store migration removes stale no-remote clone transcript for internal Repl
   assert.equal(session.transcript.some((event) => event.text.includes("Automatic clone skipped: no Git remote detected")), false);
   assert.equal(reloaded.getApp(app.id).cloneStatus.status, "external_remote_needed");
 });
+
+test("store migration recovers internal Replit git from last report when top-level git is stale", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-link-store-"));
+  const store = new Store(root);
+  const app = store.registerApp({ report: sampleReport(), controllerUrl: "http://localhost:8787", pairingCode: "ABC123" });
+  store.updateApp(app.id, {
+    git: {
+      present: false,
+      branch: null,
+      remote: null,
+      remotes: [],
+      hasInternalReplitRemote: false,
+      hasExternalRemote: false
+    },
+    cloneStatus: {
+      status: "skipped",
+      remote: null,
+      path: null,
+      message: "No Git remote detected."
+    },
+    gitSync: {
+      status: "not_available",
+      message: "No Git repository detected.",
+      remoteName: "codexlink",
+      updatedAt: new Date().toISOString(),
+      history: []
+    }
+  });
+  store.addWorkspaceTranscript(app.id, "clone", "Automatic clone skipped: no Git remote detected.");
+
+  const reloaded = new Store(root);
+  const recovered = reloaded.getApp(app.id);
+  const session = reloaded.getWorkspaceSession(app.id);
+
+  assert.equal(recovered.git.hasInternalReplitRemote, true);
+  assert.equal(recovered.cloneStatus.status, "external_remote_needed");
+  assert.equal(recovered.gitSync.status, "internal_git_detected");
+  assert.equal(session.transcript.some((event) => event.text.includes("Automatic clone skipped: no Git remote detected")), false);
+});
