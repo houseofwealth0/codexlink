@@ -1,6 +1,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { execFile, spawn } = require("child_process");
 const { Store } = require("./store");
 const { startTelegramBot } = require("./telegram");
@@ -15,6 +16,14 @@ const WORKSPACES_DIR = path.resolve(process.env.CODEX_LINK_WORKSPACES_DIR || "co
 const store = new Store(DATA_DIR);
 const activeWorkspaceProcesses = new Map();
 const activeCloneProcesses = new Map();
+
+function execFilePromise(command, args, options = {}) {
+  return new Promise((resolve) => {
+    execFile(command, args, { encoding: "utf8", maxBuffer: 1024 * 1024, ...options }, (error, stdout, stderr) => {
+      resolve({ ok: !error, code: error?.code || 0, stdout: stdout || "", stderr: stderr || "", error });
+    });
+  });
+}
 
 function externalBaseUrl(req) {
   const forwardedProto = req.headers["x-forwarded-proto"];
@@ -141,6 +150,135 @@ function updateCloneStatus(appId, patch) {
   return store.updateApp(appId, { cloneStatus: next });
 }
 
+function updateGitSync(appId, patch) {
+  const updated = store.updateGitSync(appId, patch);
+  if (updated?.gitSync?.message) store.addWorkspaceTranscript(appId, "git-sync", `${updated.gitSync.message}\n`);
+  return updated;
+}
+
+function defaultGithubRepoName(app) {
+  const report = app.lastReport || {};
+  const replit = report.replit || {};
+  return `codexlink-${safeSegment(replit.owner || "replit")}-${safeSegment(replit.slug || app.name)}`.slice(0, 90);
+}
+
+async function checkGhAuth() {
+  const status = await execFilePromise("gh", ["auth", "status"]);
+  if (!status.ok) return { ok: false, message: "GitHub CLI is not installed or not logged in. Run gh auth login on this PC." };
+  const user = await execFilePromise("gh", ["api", "user", "--jq", ".login"]);
+  if (!user.ok || !user.stdout.trim()) return { ok: false, message: "Could not read GitHub user from gh. Run gh auth login on this PC." };
+  return { ok: true, owner: user.stdout.trim() };
+}
+
+async function createGithubRepo(owner, baseName, appId) {
+  const candidates = [baseName, `${baseName}-${appId.slice(0, 8)}`];
+  let lastError = null;
+  for (const repo of candidates) {
+    const created = await execFilePromise("gh", ["api", "user/repos", "-f", `name=${repo}`, "-F", "private=true"]);
+    if (created.ok) {
+      return {
+        owner,
+        repo,
+        repoUrl: `https://github.com/${owner}/${repo}`,
+        sshUrl: `git@github.com:${owner}/${repo}.git`
+      };
+    }
+    lastError = (created.stderr || created.stdout || created.error?.message || "").trim();
+    if (!/already exists|Name already exists|HTTP 422/i.test(lastError)) break;
+  }
+  return { error: lastError || "GitHub repo creation failed." };
+}
+
+async function ensureDeployKey(appId, owner, repo) {
+  const dir = path.join(DATA_DIR, "github-keys", appId);
+  fs.mkdirSync(dir, { recursive: true });
+  const keyPath = path.join(dir, "deploy_key");
+  const publicKeyPath = `${keyPath}.pub`;
+  if (!fs.existsSync(keyPath) || !fs.existsSync(publicKeyPath)) {
+    const keygen = await execFilePromise("ssh-keygen", ["-t", "ed25519", "-N", "", "-C", `codex-link-${appId}`, "-f", keyPath]);
+    if (!keygen.ok) return { ok: false, error: keygen.stderr || keygen.stdout || "ssh-keygen failed." };
+  }
+  const publicKey = fs.readFileSync(publicKeyPath, "utf8").trim();
+  const privateKey = fs.readFileSync(keyPath, "utf8");
+  const title = `Codex Link ${appId.slice(0, 8)}`;
+  const added = await execFilePromise("gh", ["api", `repos/${owner}/${repo}/keys`, "-f", `title=${title}`, "-f", `key=${publicKey}`, "-F", "read_only=false"]);
+  if (!added.ok && !/key is already in use|already_exists|422/i.test(`${added.stderr}\n${added.stdout}`)) {
+    return { ok: false, error: added.stderr || added.stdout || "Could not add deploy key." };
+  }
+  return { ok: true, publicKey, privateKey };
+}
+
+async function startGitSync(appId) {
+  const app = store.getApp(appId);
+  if (!app) return { ok: false, error: "Workspace not found." };
+  if (app.git?.hasExternalRemote && (app.git.externalRemote?.url || app.git.remote)) {
+    updateGitSync(appId, {
+      status: "ready",
+      message: "External Git remote already exists.",
+      repoUrl: app.git.externalRemote?.url || app.git.remote,
+      sshUrl: app.git.externalRemote?.url || app.git.remote,
+      remoteName: app.git.remoteName || app.git.externalRemote?.name || "origin"
+    });
+    startWorkspaceClone(appId);
+    return { ok: true, alreadyReady: true };
+  }
+  if (!app.git?.present && !app.lastReport?.git?.present) {
+    updateGitSync(appId, { status: "failed", message: "No Git repository detected in Replit.", error: "No Git repository detected." });
+    return { ok: false, error: "No Git repository detected." };
+  }
+
+  updateGitSync(appId, {
+    status: "github_repo_creating",
+    message: "Checking GitHub CLI login and creating a private repo...",
+    startedAt: new Date().toISOString(),
+    error: null
+  });
+  const gh = await checkGhAuth();
+  if (!gh.ok) {
+    updateGitSync(appId, { status: "failed", message: gh.message, error: gh.message });
+    return { ok: false, error: gh.message };
+  }
+
+  const repoResult = await createGithubRepo(gh.owner, defaultGithubRepoName(app), appId);
+  if (repoResult.error) {
+    updateGitSync(appId, { status: "failed", message: repoResult.error, error: repoResult.error });
+    return { ok: false, error: repoResult.error };
+  }
+
+  updateGitSync(appId, {
+    status: "replit_remote_configuring",
+    message: `Created private GitHub repo ${repoResult.owner}/${repoResult.repo}. Creating deploy key...`,
+    owner: repoResult.owner,
+    repo: repoResult.repo,
+    repoUrl: repoResult.repoUrl,
+    sshUrl: repoResult.sshUrl,
+    remoteName: "codexlink",
+    createdAt: new Date().toISOString()
+  });
+
+  const deployKey = await ensureDeployKey(appId, repoResult.owner, repoResult.repo);
+  if (!deployKey.ok) {
+    updateGitSync(appId, { status: "failed", message: deployKey.error, error: deployKey.error });
+    return { ok: false, error: deployKey.error };
+  }
+
+  const branch = app.git?.branch && app.git.branch !== "HEAD" ? app.git.branch : "main";
+  store.enqueueWorkerCommand(appId, {
+    type: "configure_github_remote",
+    sshUrl: repoResult.sshUrl,
+    remoteName: "codexlink",
+    targetBranch: branch,
+    bootstrapMessage: "Codex Link bootstrap snapshot",
+    deployPrivateKey: deployKey.privateKey
+  });
+  updateGitSync(appId, {
+    status: "replit_pushing",
+    message: "Queued Replit worker to configure GitHub remote and push current workspace.",
+    branch
+  });
+  return { ok: true };
+}
+
 function startWorkspaceClone(appId) {
   const app = store.getApp(appId);
   if (!app) return { ok: false, error: "Workspace not found." };
@@ -234,6 +372,7 @@ function startWorkspaceClone(appId) {
       path: targetPath,
       message: error.message
     });
+    updateGitSync(appId, { status: "failed", message: `Controller clone failed: ${error.message}`, error: error.message });
     store.addWorkspaceTranscript(appId, "error", `Clone failed: ${error.message}`);
   });
   child.on("exit", (code, signal) => {
@@ -246,6 +385,7 @@ function startWorkspaceClone(appId) {
         path: targetPath,
         message: "Local checkout ready."
       });
+      updateGitSync(appId, { status: "ready", message: "GitHub sync ready. Local checkout is available.", repoUrl: (store.getApp(appId)?.gitSync || {}).repoUrl });
       store.addWorkspaceTranscript(appId, "clone", `Local checkout ready at ${targetPath}\n`);
       return;
     }
@@ -256,6 +396,7 @@ function startWorkspaceClone(appId) {
       path: targetPath,
       message
     });
+    updateGitSync(appId, { status: "failed", message: `Controller clone failed: ${message}`, error: message });
     store.addWorkspaceTranscript(appId, "error", `Clone failed: ${message}`);
   });
   return { ok: true, path: targetPath, pid: child.pid };
@@ -459,6 +600,7 @@ async function htmlPage(req) {
             const replit = report.replit || {};
             const git = app.git || {};
             const clone = app.cloneStatus || {};
+            const gitSync = app.gitSync || {};
             const cloneClass = clone.status === "ready" ? "online" : ["failed", "external_remote_needed"].includes(clone.status) ? "offline" : "";
             const reconnectNeeded = needsWorkerReconnect(app, publicTunnelUrl);
             const tags = (app.tags || []).map((tag) => `<span class="pill">${escapeHtml(tag)}</span>`).join("");
@@ -481,6 +623,7 @@ async function htmlPage(req) {
               <div>
                 <strong>Last heartbeat</strong>
                 <div class="muted">${escapeHtml(app.lastHeartbeatAt || "never")}</div>
+                <div><span class="pill ${gitSync.status === "ready" ? "online" : gitSync.status === "failed" ? "offline" : ""}">git: ${escapeHtml(gitSync.status || "unknown")}</span></div>
                 <div><span class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></div>
               </div>
             </a>`;
@@ -583,6 +726,7 @@ async function workspacePage(appId, req) {
   const replit = report.replit || {};
   const git = app.git || {};
   const clone = app.cloneStatus || {};
+  const gitSync = app.gitSync || {};
   const pathStatus = validateLocalPath(app.localPath);
   const cloneClass = clone.status === "ready" ? "online" : ["failed", "external_remote_needed"].includes(clone.status) ? "offline" : "";
   const publicControllerUrl = await installBaseUrl(req);
@@ -647,7 +791,7 @@ async function workspacePage(appId, req) {
       <div>
         <p><a href="/">Back to dashboard</a></p>
         <h1>${escapeHtml(workspaceName(app))}</h1>
-        <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span> <span id="clone-status" class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></p>
+        <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span> <span id="git-sync-status" class="pill ${gitSync.status === "ready" ? "online" : gitSync.status === "failed" ? "offline" : ""}">git: ${escapeHtml(gitSync.status || "unknown")}</span> <span id="clone-status" class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></p>
       </div>
       <div class="controls">
         <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/clear" onsubmit="return confirm('Clear this workspace transcript?');">
@@ -678,6 +822,18 @@ async function workspacePage(appId, req) {
     <aside class="side">
       ${reconnectNeeded && reconnectCommand ? `<section class="warning"><h2>Worker Reconnect Needed</h2><p>This workspace was installed with an older public tunnel URL. Run this once in that Replit workspace to update the existing worker without creating a duplicate app.</p><pre>${escapeHtml(reconnectCommand)}</pre></section>` : ""}
       ${pathStatus.ok ? "" : `<section class="warning"><h2>Local Checkout Needed</h2><p>Codex needs a local checkout on this PC. Codex Link tries to clone it automatically from the Replit app's Git remote during install.</p></section>`}
+      <section>
+        <h2>GitHub Sync</h2>
+        <div class="meta">
+          <div><strong>Status</strong><br><span id="git-sync-message">${escapeHtml(gitSync.message || "No GitHub sync status yet.")}</span></div>
+          <div><strong>Repo</strong><br><code id="git-sync-repo">${escapeHtml(gitSync.repoUrl || "not created yet")}</code></div>
+          <div><strong>Remote</strong><br><code>${escapeHtml(gitSync.remoteName || "codexlink")}</code></div>
+        </div>
+        ${gitSync.status === "failed" && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || "") ? `<p class="muted">Run <code>gh auth login</code> on this PC, then try again.</p>` : ""}
+        <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/git-sync/start">
+          <button type="submit">Create / Connect GitHub Remote</button>
+        </form>
+      </section>
       <section>
         <h2>Local Checkout</h2>
         <div class="meta">
@@ -739,9 +895,19 @@ async function workspacePage(appId, req) {
         const cloneMessage = document.getElementById('clone-message');
         const clonePath = document.getElementById('clone-path');
         cloneStatus.textContent = 'clone: ' + (clone.status || 'unknown');
-        cloneStatus.className = 'pill ' + (clone.status === 'ready' ? 'online' : clone.status === 'failed' ? 'offline' : '');
+        cloneStatus.className = 'pill ' + (clone.status === 'ready' ? 'online' : clone.status === 'failed' || clone.status === 'external_remote_needed' ? 'offline' : '');
         cloneMessage.textContent = clone.message || 'No clone status yet.';
         clonePath.textContent = clone.path || 'not ready yet';
+      }
+      if (payload.app?.gitSync) {
+        const gitSync = payload.app.gitSync;
+        const gitStatus = document.getElementById('git-sync-status');
+        const gitMessage = document.getElementById('git-sync-message');
+        const gitRepo = document.getElementById('git-sync-repo');
+        gitStatus.textContent = 'git: ' + (gitSync.status || 'unknown');
+        gitStatus.className = 'pill ' + (gitSync.status === 'ready' ? 'online' : gitSync.status === 'failed' ? 'offline' : '');
+        gitMessage.textContent = gitSync.message || 'No GitHub sync status yet.';
+        gitRepo.textContent = gitSync.repoUrl || 'not created yet';
       }
       for (const event of payload.events || []) appendEvent(event);
     };
@@ -801,7 +967,7 @@ function workspaceSse(req, res, appId) {
     const nextEvents = transcript.slice(lastIndex);
     lastIndex = transcript.length;
     const app = store.getApp(appId);
-    res.write(`data: ${JSON.stringify({ app: app ? { id: app.id, cloneStatus: app.cloneStatus, localPath: app.localPath } : null, session, events: nextEvents })}\n\n`);
+    res.write(`data: ${JSON.stringify({ app: app ? { id: app.id, cloneStatus: app.cloneStatus, gitSync: app.gitSync, localPath: app.localPath } : null, session, events: nextEvents })}\n\n`);
   };
   send();
   const interval = setInterval(send, 1000);
@@ -887,6 +1053,15 @@ async function handleApi(req, res, url) {
     const app = store.getApp(workspaceCloneMatch[1]);
     if (!app) return sendJson(res, 404, { error: "Workspace not found." });
     startWorkspaceClone(app.id);
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceGitSyncMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/git-sync\/start$/);
+  if (req.method === "POST" && workspaceGitSyncMatch) {
+    if (!isLocalRequest(req)) return sendJson(res, 403, { error: "GitHub sync setup is only available from localhost." });
+    const app = store.getApp(workspaceGitSyncMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    await startGitSync(app.id);
     return redirect(res, `/workspaces/${app.id}`);
   }
 
@@ -1029,6 +1204,8 @@ async function handleApi(req, res, url) {
     for (const command of commands) {
       if (command.taskId) {
         store.addTaskEvent(command.taskId, "worker", `Sent worker command: ${command.type}`, { commandId: command.id });
+      } else if (command.type === "configure_github_remote") {
+        store.addWorkspaceTranscript(app.id, "git-sync", "Sent GitHub remote setup command to Replit worker.\n");
       }
     }
     return sendJson(res, 200, { ok: true, commands });
@@ -1040,6 +1217,36 @@ async function handleApi(req, res, url) {
     const body = await readBody(req);
     for (const item of body.results || []) {
       const command = store.completeWorkerCommand(app.id, item.commandId, item.result);
+      if (command?.type === "configure_github_remote") {
+        if (item.result?.ok === false) {
+          updateGitSync(app.id, {
+            status: "failed",
+            message: item.result.error || item.result.stderr || "Replit GitHub push failed.",
+            error: item.result.error || item.result.stderr || "Replit GitHub push failed."
+          });
+        } else {
+          const gitSync = app.gitSync || {};
+          updateGitSync(app.id, {
+            status: "controller_cloning",
+            message: "Replit pushed to GitHub. Cloning on controller..."
+          });
+          store.updateApp(app.id, {
+            git: {
+              ...(app.git || {}),
+              remote: gitSync.sshUrl || command.sshUrl,
+              remoteName: command.remoteName || "codexlink",
+              hasExternalRemote: true,
+              externalRemote: { name: command.remoteName || "codexlink", url: gitSync.sshUrl || command.sshUrl, internal: false }
+            }
+          });
+          updateCloneStatus(app.id, {
+            status: "pending",
+            remote: gitSync.sshUrl || command.sshUrl,
+            message: "Replit pushed to GitHub. Controller clone queued."
+          });
+          startWorkspaceClone(app.id);
+        }
+      }
       if (command?.taskId) {
         const output = [item.result?.stdout, item.result?.stderr, item.result?.error].filter(Boolean).join("\n").trim();
         store.addTaskEvent(command.taskId, item.result?.ok === false ? "worker_error" : "worker_result", output || `Worker command ${command.type} completed.`, {

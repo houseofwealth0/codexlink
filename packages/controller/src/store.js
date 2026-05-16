@@ -46,6 +46,12 @@ class Store {
         : app.git?.hasInternalReplitRemote
           ? { status: "external_remote_needed", remote: null, path: null, message: "Replit internal Git detected. Add an external Git remote for controller sync." }
         : { status: "skipped", remote: null, path: null, message: "No Git remote detected." };
+      app.gitSync ||= {
+        status: app.git?.hasExternalRemote ? "ready" : app.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
+        message: app.git?.hasExternalRemote ? "External Git remote is configured." : app.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",
+        remoteName: "codexlink",
+        updatedAt: new Date().toISOString()
+      };
     }
   }
 
@@ -97,6 +103,12 @@ class Store {
         : report.git?.hasInternalReplitRemote
           ? { status: "external_remote_needed", remote: null, path: null, message: "Replit internal Git detected. Add an external Git remote for controller sync." }
         : { status: "skipped", remote: null, path: null, message: "No Git remote detected; automatic clone is unavailable." },
+      gitSync: {
+        status: report.git?.hasExternalRemote ? "ready" : report.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
+        message: report.git?.hasExternalRemote ? "External Git remote is configured." : report.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",
+        remoteName: "codexlink",
+        updatedAt: new Date().toISOString()
+      },
       appType: report.appType,
       packageManager: report.packageManager,
       controllerUrl,
@@ -145,6 +157,17 @@ class Store {
     if (Object.prototype.hasOwnProperty.call(patch, "notes")) allowed.notes = String(patch.notes || "");
     if (Object.prototype.hasOwnProperty.call(patch, "localPath")) allowed.localPath = String(patch.localPath || "").trim();
     return this.updateApp(appId, allowed);
+  }
+
+  updateGitSync(appId, patch) {
+    const app = this.getApp(appId);
+    if (!app) return null;
+    const gitSync = {
+      ...(app.gitSync || {}),
+      ...patch,
+      updatedAt: new Date().toISOString()
+    };
+    return this.updateApp(appId, { gitSync });
   }
 
   getWorkspaceSession(appId) {
@@ -322,6 +345,7 @@ class Store {
     const command = commands.find((candidate) => candidate.id === commandId);
     if (!command) return null;
     command.status = result?.ok === false ? "failed" : "completed";
+    if (command.deployPrivateKey) command.deployPrivateKey = "[redacted]";
     command.result = result;
     command.completedAt = new Date().toISOString();
     this.save();
