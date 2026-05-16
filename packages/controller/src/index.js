@@ -126,6 +126,53 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function statusClass(status) {
+  if (["ready", "github_login_started"].includes(status)) return "online";
+  if (["failed", "not_available"].includes(status)) return "offline";
+  return "active";
+}
+
+function gitSyncNextAction(gitSync = {}) {
+  switch (gitSync.status) {
+    case "internal_git_detected":
+      return "Click Create / Connect GitHub Remote to create a private GitHub repo and start sync.";
+    case "github_repo_creating":
+      return "Controller is checking GitHub auth and creating the private repo.";
+    case "github_login_started":
+      return "Finish the GitHub login window, then click Create / Connect GitHub Remote again.";
+    case "replit_remote_configuring":
+      return "Controller is preparing the deploy key and Replit remote configuration.";
+    case "replit_pushing":
+      return "Waiting for the Replit worker to add the remote, commit if needed, and push.";
+    case "controller_cloning":
+      return "Replit pushed successfully. Controller is cloning the repo locally.";
+    case "ready":
+      return "GitHub sync is ready. Codex can use the local checkout.";
+    case "failed":
+      return /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || "")
+        ? "Click Open GitHub Login, finish auth, then retry GitHub sync."
+        : "Review the latest error, then retry GitHub sync.";
+    case "not_available":
+      return "No Git repository was detected in Replit yet.";
+    default:
+      return "Waiting for GitHub sync to start.";
+  }
+}
+
+function renderGitSyncTimeline(gitSync = {}) {
+  const history = gitSync.history || [];
+  if (!history.length) return `<li class="timeline-empty">No GitHub sync events yet.</li>`;
+  return history.slice(-20).reverse().map((item) => `
+    <li class="${escapeHtml(statusClass(item.status))}">
+      <div class="timeline-dot"></div>
+      <div>
+        <div class="timeline-head"><strong>${escapeHtml(item.status || "event")}</strong><span>${escapeHtml(item.createdAt ? new Date(item.createdAt).toLocaleString() : "")}</span></div>
+        <div>${escapeHtml(item.message || "")}</div>
+      </div>
+    </li>
+  `).join("");
+}
+
 function workspaceName(app) {
   return app?.displayName || app?.replit?.slug || app?.name || "Workspace";
 }
@@ -265,6 +312,10 @@ async function startGitSync(appId) {
     updateGitSync(appId, { status: "failed", message: gh.message, error: gh.message });
     return { ok: false, error: gh.message };
   }
+  updateGitSync(appId, {
+    status: "github_repo_creating",
+    message: `GitHub CLI is logged in as ${gh.owner}. Creating private repo...`
+  });
 
   const repoResult = await createGithubRepo(gh.owner, defaultGithubRepoName(app), appId);
   if (repoResult.error) {
@@ -288,6 +339,10 @@ async function startGitSync(appId) {
     updateGitSync(appId, { status: "failed", message: deployKey.error, error: deployKey.error });
     return { ok: false, error: deployKey.error };
   }
+  updateGitSync(appId, {
+    status: "replit_remote_configuring",
+    message: "Writable deploy key added to GitHub. Waiting for the Replit worker to receive setup command..."
+  });
 
   const branch = app.git?.branch && app.git.branch !== "HEAD" ? app.git.branch : "main";
   store.enqueueWorkerCommand(appId, {
@@ -584,6 +639,7 @@ async function htmlPage(req) {
     .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #eef2ff; color: #243b7a; }
     .online { background: #e8f7ee; color: #14532d; }
     .offline { background: #f3f4f6; color: #4b5563; }
+    .active { background: #e0f2fe; color: #075985; }
     @media (prefers-color-scheme: dark) {
       body { background: #101319; color: #eef2f7; }
       header, section { background: #171b23; border-color: #2a303b; }
@@ -650,7 +706,8 @@ async function htmlPage(req) {
               <div>
                 <strong>Last heartbeat</strong>
                 <div class="muted">${escapeHtml(app.lastHeartbeatAt || "never")}</div>
-                <div><span class="pill ${gitSync.status === "ready" ? "online" : gitSync.status === "failed" ? "offline" : ""}">git: ${escapeHtml(gitSync.status || "unknown")}</span></div>
+                <div><span class="pill ${escapeHtml(statusClass(gitSync.status))}">git: ${escapeHtml(gitSync.status || "unknown")}</span></div>
+                <div class="muted">${escapeHtml(gitSync.message || "No GitHub sync status yet.")}</div>
                 <div><span class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></div>
               </div>
             </a>`;
@@ -797,10 +854,21 @@ async function workspacePage(appId, req) {
     .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; background: #eef2ff; color: #243b7a; }
     .online { background: #e8f7ee; color: #14532d; }
     .offline { background: #f3f4f6; color: #4b5563; }
+    .active { background: #e0f2fe; color: #075985; }
     .warning { background: #fff7ed; border-color: #fed7aa; }
     .muted { color: #687386; }
     code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
     form.inline { display: inline; }
+    .timeline { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 10px; }
+    .timeline li { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 10px; align-items: start; font-size: 13px; }
+    .timeline-dot { width: 9px; height: 9px; margin-top: 5px; border-radius: 999px; background: #98a2b3; }
+    .timeline li.online .timeline-dot { background: #16a34a; }
+    .timeline li.offline .timeline-dot { background: #b42318; }
+    .timeline li.active .timeline-dot { background: #0284c7; }
+    .timeline-head { display: flex; justify-content: space-between; gap: 8px; color: #475467; }
+    .timeline-head span { white-space: nowrap; font-size: 12px; }
+    .timeline-empty { color: #687386; }
+    .next-action { padding: 10px; border: 1px solid #dbeafe; background: #eff6ff; border-radius: 6px; color: #1e3a8a; }
     @media (prefers-color-scheme: dark) {
       body { background: #101319; color: #eef2f7; }
       header, section { background: #171b23; border-color: #2a303b; }
@@ -818,7 +886,7 @@ async function workspacePage(appId, req) {
       <div>
         <p><a href="/">Back to dashboard</a></p>
         <h1>${escapeHtml(workspaceName(app))}</h1>
-        <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span> <span id="git-sync-status" class="pill ${gitSync.status === "ready" ? "online" : gitSync.status === "failed" ? "offline" : ""}">git: ${escapeHtml(gitSync.status || "unknown")}</span> <span id="clone-status" class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></p>
+        <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span> <span id="git-sync-status" class="pill ${escapeHtml(statusClass(gitSync.status))}">git: ${escapeHtml(gitSync.status || "unknown")}</span> <span id="clone-status" class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></p>
       </div>
       <div class="controls">
         <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/clear" onsubmit="return confirm('Clear this workspace transcript?');">
@@ -852,13 +920,18 @@ async function workspacePage(appId, req) {
       <section>
         <h2>GitHub Sync</h2>
         <div class="meta">
-          <div><strong>Status</strong><br><span id="git-sync-message">${escapeHtml(gitSync.message || "No GitHub sync status yet.")}</span></div>
+          <div><strong>Current step</strong><br><span id="git-sync-message">${escapeHtml(gitSync.message || "No GitHub sync status yet.")}</span></div>
+          <div class="next-action"><strong>Next</strong><br><span id="git-sync-next">${escapeHtml(gitSyncNextAction(gitSync))}</span></div>
           <div><strong>Repo</strong><br><code id="git-sync-repo">${escapeHtml(gitSync.repoUrl || "not created yet")}</code></div>
+          <div><strong>Branch</strong><br><code id="git-sync-branch">${escapeHtml(gitSync.branch || git.branch || "not selected yet")}</code></div>
           <div><strong>Remote</strong><br><code>${escapeHtml(gitSync.remoteName || "codexlink")}</code></div>
         </div>
-        ${gitSync.status === "failed" && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || "") ? `<form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/github-login"><button type="submit">Open GitHub Login</button></form>` : ""}
+        <ol id="git-sync-timeline" class="timeline">${renderGitSyncTimeline(gitSync)}</ol>
+        <form id="git-login-form" class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/github-login" ${gitSync.status === "failed" && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || "") ? "" : "hidden"}>
+          <button type="submit">Open GitHub Login</button>
+        </form>
         <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/git-sync/start">
-          <button type="submit">Create / Connect GitHub Remote</button>
+          <button id="git-sync-button" type="submit">${gitSync.status === "failed" ? "Retry GitHub Sync" : "Create / Connect GitHub Remote"}</button>
         </form>
       </section>
       <section>
@@ -905,6 +978,67 @@ async function workspacePage(appId, req) {
   <script>
     const terminal = document.getElementById('terminal');
     const status = document.getElementById('session-status');
+    const initialGitBranch = ${JSON.stringify(git.branch || "not selected yet")};
+    function syncClass(syncStatus) {
+      if (syncStatus === 'ready' || syncStatus === 'github_login_started') return 'online';
+      if (syncStatus === 'failed' || syncStatus === 'not_available') return 'offline';
+      return 'active';
+    }
+    function gitSyncNextAction(gitSync) {
+      switch (gitSync?.status) {
+        case 'internal_git_detected':
+          return 'Click Create / Connect GitHub Remote to create a private GitHub repo and start sync.';
+        case 'github_repo_creating':
+          return 'Controller is checking GitHub auth and creating the private repo.';
+        case 'github_login_started':
+          return 'Finish the GitHub login window, then click Create / Connect GitHub Remote again.';
+        case 'replit_remote_configuring':
+          return 'Controller is preparing the deploy key and Replit remote configuration.';
+        case 'replit_pushing':
+          return 'Waiting for the Replit worker to add the remote, commit if needed, and push.';
+        case 'controller_cloning':
+          return 'Replit pushed successfully. Controller is cloning the repo locally.';
+        case 'ready':
+          return 'GitHub sync is ready. Codex can use the local checkout.';
+        case 'failed':
+          return /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || '')
+            ? 'Click Open GitHub Login, finish auth, then retry GitHub sync.'
+            : 'Review the latest error, then retry GitHub sync.';
+        case 'not_available':
+          return 'No Git repository was detected in Replit yet.';
+        default:
+          return 'Waiting for GitHub sync to start.';
+      }
+    }
+    function renderGitTimeline(history) {
+      const list = document.getElementById('git-sync-timeline');
+      if (!list) return;
+      const items = (history || []).slice(-20).reverse();
+      if (!items.length) {
+        list.innerHTML = '<li class="timeline-empty">No GitHub sync events yet.</li>';
+        return;
+      }
+      list.innerHTML = '';
+      for (const item of items) {
+        const row = document.createElement('li');
+        row.className = syncClass(item.status);
+        const dot = document.createElement('div');
+        dot.className = 'timeline-dot';
+        const body = document.createElement('div');
+        const head = document.createElement('div');
+        head.className = 'timeline-head';
+        const strong = document.createElement('strong');
+        strong.textContent = item.status || 'event';
+        const time = document.createElement('span');
+        time.textContent = item.createdAt ? new Date(item.createdAt).toLocaleString() : '';
+        const message = document.createElement('div');
+        message.textContent = item.message || '';
+        head.append(strong, time);
+        body.append(head, message);
+        row.append(dot, body);
+        list.append(row);
+      }
+    }
     function appendEvent(event) {
       const when = new Date(event.createdAt).toLocaleTimeString();
       const prefix = '[' + when + '] ' + event.type + ': ';
@@ -930,11 +1064,20 @@ async function workspacePage(appId, req) {
         const gitSync = payload.app.gitSync;
         const gitStatus = document.getElementById('git-sync-status');
         const gitMessage = document.getElementById('git-sync-message');
+        const gitNext = document.getElementById('git-sync-next');
         const gitRepo = document.getElementById('git-sync-repo');
+        const gitBranch = document.getElementById('git-sync-branch');
+        const loginForm = document.getElementById('git-login-form');
+        const syncButton = document.getElementById('git-sync-button');
         gitStatus.textContent = 'git: ' + (gitSync.status || 'unknown');
-        gitStatus.className = 'pill ' + (gitSync.status === 'ready' ? 'online' : gitSync.status === 'failed' ? 'offline' : '');
+        gitStatus.className = 'pill ' + syncClass(gitSync.status);
         gitMessage.textContent = gitSync.message || 'No GitHub sync status yet.';
+        gitNext.textContent = gitSyncNextAction(gitSync);
         gitRepo.textContent = gitSync.repoUrl || 'not created yet';
+        gitBranch.textContent = gitSync.branch || initialGitBranch;
+        if (loginForm) loginForm.hidden = !(gitSync.status === 'failed' && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || ''));
+        if (syncButton) syncButton.textContent = gitSync.status === 'failed' ? 'Retry GitHub Sync' : 'Create / Connect GitHub Remote';
+        renderGitTimeline(gitSync.history);
       }
       for (const event of payload.events || []) appendEvent(event);
     };
@@ -1255,6 +1398,10 @@ async function handleApi(req, res, url) {
         store.addTaskEvent(command.taskId, "worker", `Sent worker command: ${command.type}`, { commandId: command.id });
       } else if (command.type === "configure_github_remote") {
         store.addWorkspaceTranscript(app.id, "git-sync", "Sent GitHub remote setup command to Replit worker.\n");
+        updateGitSync(app.id, {
+          status: "replit_pushing",
+          message: "Replit worker received the GitHub remote setup command."
+        });
       }
     }
     return sendJson(res, 200, { ok: true, commands });

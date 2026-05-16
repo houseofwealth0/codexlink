@@ -59,8 +59,10 @@ class Store {
         status: app.git?.hasExternalRemote ? "ready" : app.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
         message: app.git?.hasExternalRemote ? "External Git remote is configured." : app.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",
         remoteName: "codexlink",
-        updatedAt: new Date().toISOString()
+        updatedAt: new Date().toISOString(),
+        history: []
       };
+      app.gitSync.history ||= [];
     }
   }
 
@@ -116,7 +118,13 @@ class Store {
         status: report.git?.hasExternalRemote ? "ready" : report.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
         message: report.git?.hasExternalRemote ? "External Git remote is configured." : report.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",
         remoteName: "codexlink",
-        updatedAt: new Date().toISOString()
+        updatedAt: new Date().toISOString(),
+        history: [{
+          id: crypto.randomUUID(),
+          status: report.git?.hasExternalRemote ? "ready" : report.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
+          message: report.git?.hasExternalRemote ? "External Git remote is configured." : report.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",
+          createdAt: new Date().toISOString()
+        }]
       },
       appType: report.appType,
       packageManager: report.packageManager,
@@ -171,10 +179,27 @@ class Store {
   updateGitSync(appId, patch) {
     const app = this.getApp(appId);
     if (!app) return null;
+    const current = app.gitSync || {};
+    const timestamp = new Date().toISOString();
+    const status = patch.status || current.status || "unknown";
+    const message = Object.prototype.hasOwnProperty.call(patch, "message") ? patch.message : current.message;
+    const history = [...(current.history || [])];
+    if (message || patch.status) {
+      const last = history[history.length - 1];
+      if (!last || last.status !== status || last.message !== message) {
+        history.push({
+          id: crypto.randomUUID(),
+          status,
+          message: String(message || status),
+          createdAt: timestamp
+        });
+      }
+    }
     const gitSync = {
-      ...(app.gitSync || {}),
+      ...current,
       ...patch,
-      updatedAt: new Date().toISOString()
+      history: history.slice(-120),
+      updatedAt: timestamp
     };
     return this.updateApp(appId, { gitSync });
   }
