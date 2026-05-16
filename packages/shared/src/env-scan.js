@@ -37,7 +37,8 @@ function execGit(root, args) {
 function isReplitInternalRemote(url) {
   return /^git:\/\/gitsafe[:/]/i.test(url)
     || /^git\+ssh:\/\/git@ssh\.worf\.replit\.dev[:/]/i.test(url)
-    || /^ssh:\/\/git@ssh\.worf\.replit\.dev[:/]/i.test(url);
+    || /^ssh:\/\/git@ssh\.worf\.replit\.dev[:/]/i.test(url)
+    || /^git@ssh\.worf\.replit\.dev:/i.test(url);
 }
 
 function parseRemotes(text) {
@@ -64,36 +65,33 @@ function chooseExternalRemote(remotes) {
   return external.find((remote) => remote.name === "origin") || external[0] || null;
 }
 
-function gitInfo(root) {
+function tryGit(root, args, fallback = null) {
   try {
-    const branch = execGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
-    const remotes = parseRemotes(execGit(root, ["remote", "-v"]));
-    const externalRemote = chooseExternalRemote(remotes);
-    const dirty = execGit(root, ["status", "--porcelain"]).length > 0;
-    return {
-      present: true,
-      branch,
-      remote: externalRemote?.url || null,
-      remoteName: externalRemote?.name || null,
-      externalRemote,
-      remotes,
-      hasInternalReplitRemote: remotes.some((remote) => remote.internal),
-      hasExternalRemote: Boolean(externalRemote),
-      dirty
-    };
+    const value = execGit(root, args);
+    return value || fallback;
   } catch {
-    return {
-      present: exists(root, ".git"),
-      branch: null,
-      remote: null,
-      remoteName: null,
-      externalRemote: null,
-      remotes: [],
-      hasInternalReplitRemote: false,
-      hasExternalRemote: false,
-      dirty: null
-    };
+    return fallback;
   }
+}
+
+function gitInfo(root) {
+  const branch = tryGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const remoteText = tryGit(root, ["remote", "-v"], "");
+  const statusText = tryGit(root, ["status", "--porcelain"]);
+  const isInsideWorkTree = tryGit(root, ["rev-parse", "--is-inside-work-tree"], "false") === "true";
+  const remotes = parseRemotes(remoteText);
+  const externalRemote = chooseExternalRemote(remotes);
+  return {
+    present: isInsideWorkTree || exists(root, ".git") || remotes.length > 0,
+    branch,
+    remote: externalRemote?.url || null,
+    remoteName: externalRemote?.name || null,
+    externalRemote,
+    remotes,
+    hasInternalReplitRemote: remotes.some((remote) => remote.internal),
+    hasExternalRemote: Boolean(externalRemote),
+    dirty: statusText === null ? null : statusText.length > 0
+  };
 }
 
 function listTopLevel(root) {

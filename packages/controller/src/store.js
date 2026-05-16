@@ -55,6 +55,14 @@ class Store {
           message: "Replit internal Git detected. Use GitHub Sync to create an external remote."
         };
       }
+      if (!app.git?.hasExternalRemote && app.git?.hasInternalReplitRemote) {
+        const session = this.data.workspaceSessions[app.id];
+        if (session?.transcript?.length) {
+          session.transcript = session.transcript.filter((event) => {
+            return !String(event.text || "").includes("Automatic clone skipped: no Git remote detected");
+          });
+        }
+      }
       app.gitSync ||= {
         status: app.git?.hasExternalRemote ? "ready" : app.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
         message: app.git?.hasExternalRemote ? "External Git remote is configured." : app.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",

@@ -40,3 +40,28 @@ test("git sync updates append timeline history without duplicating identical mes
     "replit_pushing"
   ]);
 });
+
+test("internal Replit git starts in sync-needed state without misleading no-remote clone skip", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-link-store-"));
+  const store = new Store(root);
+  const app = store.registerApp({ report: sampleReport(), controllerUrl: "http://localhost:8787", pairingCode: "ABC123" });
+  const session = store.getWorkspaceSession(app.id);
+
+  assert.equal(app.cloneStatus.status, "external_remote_needed");
+  assert.equal(app.gitSync.status, "internal_git_detected");
+  assert.equal(session.transcript.some((event) => event.text.includes("Automatic clone skipped: no Git remote detected")), false);
+});
+
+test("store migration removes stale no-remote clone transcript for internal Replit git", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-link-store-"));
+  const store = new Store(root);
+  const app = store.registerApp({ report: sampleReport(), controllerUrl: "http://localhost:8787", pairingCode: "ABC123" });
+  store.addWorkspaceTranscript(app.id, "clone", "Automatic clone skipped: no Git remote detected.");
+  store.save();
+
+  const reloaded = new Store(root);
+  const session = reloaded.getWorkspaceSession(app.id);
+
+  assert.equal(session.transcript.some((event) => event.text.includes("Automatic clone skipped: no Git remote detected")), false);
+  assert.equal(reloaded.getApp(app.id).cloneStatus.status, "external_remote_needed");
+});

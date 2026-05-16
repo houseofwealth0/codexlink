@@ -819,10 +819,13 @@ async function workspacePage(appId, req) {
   const tags = (app.tags || []).join(", ");
   const notes = app.notes || "";
   const localPath = app.localPath || "";
+  const autoSyncAvailable = Boolean(git.hasInternalReplitRemote || gitSync.status === "internal_git_detected" || gitSync.status === "failed" || gitSync.status === "github_login_started");
   const promptDisabled = pathStatus.ok ? "" : "disabled";
   const promptHint = pathStatus.ok
     ? `Codex will run locally in ${pathStatus.path}`
-    : pathStatus.error;
+    : autoSyncAvailable
+      ? "Codex will be enabled after GitHub Sync creates the local checkout automatically."
+      : pathStatus.error;
 
   return `<!doctype html>
 <html>
@@ -916,7 +919,7 @@ async function workspacePage(appId, req) {
     </section>
     <aside class="side">
       ${reconnectNeeded && reconnectCommand ? `<section class="warning"><h2>Worker Reconnect Needed</h2><p>This workspace was installed with an older public tunnel URL. Run this once in that Replit workspace to update the existing worker without creating a duplicate app.</p><pre>${escapeHtml(reconnectCommand)}</pre></section>` : ""}
-      ${pathStatus.ok ? "" : `<section class="warning"><h2>Local Checkout Needed</h2><p>Codex needs a local checkout on this PC. Codex Link tries to clone it automatically from the Replit app's Git remote during install.</p></section>`}
+      ${pathStatus.ok ? "" : autoSyncAvailable ? `<section class="warning"><h2>GitHub Sync Needed</h2><p>This Replit workspace has internal Git, so Codex Link needs to create a private GitHub remote before it can clone the project locally. Use the GitHub Sync panel below; you should not have to pick a folder manually.</p></section>` : `<section class="warning"><h2>Local Checkout Needed</h2><p>Codex needs a local checkout on this PC. If this project has a Git remote, use Clone / Retry Local Checkout. Otherwise set a local path manually.</p></section>`}
       <section>
         <h2>GitHub Sync</h2>
         <div class="meta">
