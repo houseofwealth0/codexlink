@@ -46,6 +46,15 @@ class Store {
         : app.git?.hasInternalReplitRemote
           ? { status: "external_remote_needed", remote: null, path: null, message: "Replit internal Git detected. Add an external Git remote for controller sync." }
         : { status: "skipped", remote: null, path: null, message: "No Git remote detected." };
+      if (!app.git?.hasExternalRemote && app.git?.hasInternalReplitRemote && ["skipped", "failed"].includes(app.cloneStatus.status)) {
+        app.cloneStatus = {
+          ...app.cloneStatus,
+          status: "external_remote_needed",
+          remote: null,
+          path: null,
+          message: "Replit internal Git detected. Use GitHub Sync to create an external remote."
+        };
+      }
       app.gitSync ||= {
         status: app.git?.hasExternalRemote ? "ready" : app.git?.hasInternalReplitRemote ? "internal_git_detected" : "not_available",
         message: app.git?.hasExternalRemote ? "External Git remote is configured." : app.git?.hasInternalReplitRemote ? "Replit internal Git detected." : "No Git repository detected.",

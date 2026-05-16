@@ -291,7 +291,7 @@ function startWorkspaceClone(appId) {
         status: "external_remote_needed",
         remote: null,
         path: null,
-        message: "Replit internal Git detected. Add an external Git remote for controller sync."
+        message: "Replit internal Git detected. Use GitHub Sync to create an external remote."
       });
       store.addWorkspaceTranscript(appId, "clone", "Automatic clone paused: Replit internal Git is present, but no external clone remote was found.");
       return { ok: false, error: "External Git remote needed." };
