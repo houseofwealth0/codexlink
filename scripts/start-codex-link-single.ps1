@@ -4,6 +4,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $Root = Split-Path -Parent $PSScriptRoot
 $Node = "C:\Program Files\nodejs\node.exe"
 $Cloudflared = "C:\tmp\cloudflared\cloudflared.exe"
+$GitHubCli = "C:\tmp\gh\bin\gh.exe"
 $DataDir = Join-Path $Root "codex-link-data"
 $LogDir = Join-Path $DataDir "logs"
 $TunnelFile = Join-Path $DataDir "tunnel-url.txt"
@@ -69,6 +70,9 @@ try {
   $Controller.StartInfo.EnvironmentVariables["CODEX_LINK_PORT"] = "8787"
   $Controller.StartInfo.EnvironmentVariables["CODEX_LINK_HOST"] = "127.0.0.1"
   $Controller.StartInfo.EnvironmentVariables["CODEX_LINK_BASE_URL"] = "http://localhost:8787"
+  if (Test-Path $GitHubCli) {
+    $Controller.StartInfo.EnvironmentVariables["CODEX_LINK_GH_BIN"] = $GitHubCli
+  }
   $Controller.Start() | Out-Null
   Register-ObjectEvent -InputObject $Controller -EventName OutputDataReceived -Action {
     if ($EventArgs.Data) {

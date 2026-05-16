@@ -25,6 +25,33 @@ function execFilePromise(command, args, options = {}) {
   });
 }
 
+function ghCommand() {
+  return process.env.CODEX_LINK_GH_BIN || "gh";
+}
+
+function openVisibleCommand(command, args = []) {
+  if (process.platform === "win32") {
+    return new Promise((resolve) => {
+      const psArgs = [
+        "-NoExit",
+        "-Command",
+        `& ${JSON.stringify(command)} ${args.map((arg) => JSON.stringify(arg)).join(" ")}`
+      ];
+      const child = spawn("powershell.exe", psArgs, {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: false
+      });
+      child.on("error", (error) => resolve({ ok: false, error: error.message }));
+      child.unref();
+      resolve({ ok: true, pid: child.pid });
+    });
+  }
+  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  child.unref();
+  return Promise.resolve({ ok: true, pid: child.pid });
+}
+
 function externalBaseUrl(req) {
   const forwardedProto = req.headers["x-forwarded-proto"];
   const forwardedHost = req.headers["x-forwarded-host"];
@@ -163,9 +190,9 @@ function defaultGithubRepoName(app) {
 }
 
 async function checkGhAuth() {
-  const status = await execFilePromise("gh", ["auth", "status"]);
+  const status = await execFilePromise(ghCommand(), ["auth", "status"]);
   if (!status.ok) return { ok: false, message: "GitHub CLI is not installed or not logged in. Run gh auth login on this PC." };
-  const user = await execFilePromise("gh", ["api", "user", "--jq", ".login"]);
+  const user = await execFilePromise(ghCommand(), ["api", "user", "--jq", ".login"]);
   if (!user.ok || !user.stdout.trim()) return { ok: false, message: "Could not read GitHub user from gh. Run gh auth login on this PC." };
   return { ok: true, owner: user.stdout.trim() };
 }
@@ -174,7 +201,7 @@ async function createGithubRepo(owner, baseName, appId) {
   const candidates = [baseName, `${baseName}-${appId.slice(0, 8)}`];
   let lastError = null;
   for (const repo of candidates) {
-    const created = await execFilePromise("gh", ["api", "user/repos", "-f", `name=${repo}`, "-F", "private=true"]);
+    const created = await execFilePromise(ghCommand(), ["api", "user/repos", "-f", `name=${repo}`, "-F", "private=true"]);
     if (created.ok) {
       return {
         owner,
@@ -201,7 +228,7 @@ async function ensureDeployKey(appId, owner, repo) {
   const publicKey = fs.readFileSync(publicKeyPath, "utf8").trim();
   const privateKey = fs.readFileSync(keyPath, "utf8");
   const title = `Codex Link ${appId.slice(0, 8)}`;
-  const added = await execFilePromise("gh", ["api", `repos/${owner}/${repo}/keys`, "-f", `title=${title}`, "-f", `key=${publicKey}`, "-F", "read_only=false"]);
+  const added = await execFilePromise(ghCommand(), ["api", `repos/${owner}/${repo}/keys`, "-f", `title=${title}`, "-f", `key=${publicKey}`, "-F", "read_only=false"]);
   if (!added.ok && !/key is already in use|already_exists|422/i.test(`${added.stderr}\n${added.stdout}`)) {
     return { ok: false, error: added.stderr || added.stdout || "Could not add deploy key." };
   }
@@ -829,7 +856,7 @@ async function workspacePage(appId, req) {
           <div><strong>Repo</strong><br><code id="git-sync-repo">${escapeHtml(gitSync.repoUrl || "not created yet")}</code></div>
           <div><strong>Remote</strong><br><code>${escapeHtml(gitSync.remoteName || "codexlink")}</code></div>
         </div>
-        ${gitSync.status === "failed" && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || "") ? `<p class="muted">Run <code>gh auth login</code> on this PC, then try again.</p>` : ""}
+        ${gitSync.status === "failed" && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || "") ? `<form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/github-login"><button type="submit">Open GitHub Login</button></form>` : ""}
         <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/git-sync/start">
           <button type="submit">Create / Connect GitHub Remote</button>
         </form>
@@ -1062,6 +1089,28 @@ async function handleApi(req, res, url) {
     const app = store.getApp(workspaceGitSyncMatch[1]);
     if (!app) return sendJson(res, 404, { error: "Workspace not found." });
     await startGitSync(app.id);
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceGithubLoginMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/github-login$/);
+  if (req.method === "POST" && workspaceGithubLoginMatch) {
+    if (!isLocalRequest(req)) return sendJson(res, 403, { error: "GitHub login is only available from localhost." });
+    const app = store.getApp(workspaceGithubLoginMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    const opened = await openVisibleCommand(ghCommand(), ["auth", "login"]);
+    if (opened.ok) {
+      updateGitSync(app.id, {
+        status: "github_login_started",
+        message: "Opened GitHub login window. Complete it, then click Create / Connect GitHub Remote again.",
+        error: null
+      });
+    } else {
+      updateGitSync(app.id, {
+        status: "failed",
+        message: `Could not open GitHub login: ${opened.error}`,
+        error: opened.error
+      });
+    }
     return redirect(res, `/workspaces/${app.id}`);
   }
 
