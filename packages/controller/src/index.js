@@ -273,6 +273,17 @@ function isGithubSshRemote(remote) {
     || /^ssh:\/\/git@github\.com\//i.test(String(remote || ""));
 }
 
+function parseGithubRemote(remote) {
+  const value = String(remote || "").trim();
+  let match = value.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (match) return { owner: match[1], repo: match[2].replace(/\.git$/i, "") };
+  match = value.match(/^ssh:\/\/git@github\.com\/([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (match) return { owner: match[1], repo: match[2].replace(/\.git$/i, "") };
+  match = value.match(/^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (match) return { owner: match[1], repo: match[2].replace(/\.git$/i, "") };
+  return null;
+}
+
 function gitEnvForRemote(appId, remote) {
   if (!isGithubSshRemote(remote)) return process.env;
   const keyPath = githubDeployKeyPath(appId);
@@ -344,17 +355,45 @@ async function ensureDeployKey(appId, owner, repo) {
   return { ok: true, publicKey, privateKey };
 }
 
+async function ensureControllerCloneAccess(appId, remote) {
+  if (!isGithubSshRemote(remote)) return { ok: true };
+  if (fs.existsSync(githubDeployKeyPath(appId))) return { ok: true };
+  const parsed = parseGithubRemote(remote);
+  if (!parsed) return { ok: false, error: "Could not parse GitHub SSH remote for deploy key setup." };
+  updateGitSync(appId, {
+    status: "controller_cloning",
+    message: `External GitHub remote exists. Creating controller deploy key for ${parsed.owner}/${parsed.repo}...`,
+    owner: parsed.owner,
+    repo: parsed.repo,
+    repoUrl: `https://github.com/${parsed.owner}/${parsed.repo}`,
+    sshUrl: `git@github.com:${parsed.owner}/${parsed.repo}.git`
+  });
+  const deployKey = await ensureDeployKey(appId, parsed.owner, parsed.repo);
+  if (!deployKey.ok) return deployKey;
+  updateGitSync(appId, {
+    status: "controller_cloning",
+    message: "Controller deploy key is ready. Cloning on controller..."
+  });
+  return { ok: true };
+}
+
 async function startGitSync(appId) {
   const app = store.getApp(appId);
   if (!app) return { ok: false, error: "Workspace not found." };
   if (app.git?.hasExternalRemote && (app.git.externalRemote?.url || app.git.remote)) {
+    const remote = app.git.externalRemote?.url || app.git.remote;
     updateGitSync(appId, {
-      status: "ready",
+      status: "controller_cloning",
       message: "External Git remote already exists.",
-      repoUrl: app.git.externalRemote?.url || app.git.remote,
-      sshUrl: app.git.externalRemote?.url || app.git.remote,
+      repoUrl: remote,
+      sshUrl: remote,
       remoteName: app.git.remoteName || app.git.externalRemote?.name || "origin"
     });
+    const access = await ensureControllerCloneAccess(appId, remote);
+    if (!access.ok) {
+      updateGitSync(appId, { status: "failed", message: access.error, error: access.error });
+      return { ok: false, error: access.error };
+    }
     startWorkspaceClone(appId);
     return { ok: true, alreadyReady: true };
   }
@@ -1579,5 +1618,6 @@ if (require.main === module) {
 module.exports = {
   gitEnvForRemote,
   githubDeployKeyPath,
-  isGithubSshRemote
+  isGithubSshRemote,
+  parseGithubRemote
 };

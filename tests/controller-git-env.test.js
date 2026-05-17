@@ -8,7 +8,7 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-link-controller-"))
 process.env.CODEX_LINK_DATA_DIR = dataDir;
 process.env.CODEX_LINK_PORT = "0";
 
-const { gitEnvForRemote, githubDeployKeyPath, isGithubSshRemote } = require("../packages/controller/src/index");
+const { gitEnvForRemote, githubDeployKeyPath, isGithubSshRemote, parseGithubRemote } = require("../packages/controller/src/index");
 
 test("controller clone uses workspace deploy key for GitHub SSH remotes", () => {
   const appId = "app-123";
@@ -28,4 +28,19 @@ test("controller clone uses workspace deploy key for GitHub SSH remotes", () => 
 test("controller clone leaves non-GitHub remotes on default git environment", () => {
   const env = gitEnvForRemote("app-456", "https://github.com/houseofwealth0/example.git");
   assert.equal(env, process.env);
+});
+
+test("controller parses GitHub remotes for existing remote deploy key setup", () => {
+  assert.deepEqual(parseGithubRemote("git@github.com:houseofwealth0/example.git"), {
+    owner: "houseofwealth0",
+    repo: "example"
+  });
+  assert.deepEqual(parseGithubRemote("ssh://git@github.com/houseofwealth0/example.git"), {
+    owner: "houseofwealth0",
+    repo: "example"
+  });
+  assert.deepEqual(parseGithubRemote("https://github.com/houseofwealth0/example.git"), {
+    owner: "houseofwealth0",
+    repo: "example"
+  });
 });
