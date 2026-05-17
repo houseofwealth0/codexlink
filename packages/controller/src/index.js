@@ -226,6 +226,10 @@ function defaultWorkspacePath(app) {
   return path.join(WORKSPACES_DIR, label);
 }
 
+function normalizeRemote(remote) {
+  return String(remote || "").trim().replace(/\.git$/i, "");
+}
+
 function workerReconnectCommand(app, controllerUrl) {
   if (!app || !controllerUrl || controllerUrl === BASE_URL) return null;
   return `npx --yes github:houseofwealth0/codexlink#main reconnect --controller ${controllerUrl} --app-id ${app.id}`;
@@ -301,6 +305,27 @@ function gitEnvForRemote(appId, remote) {
     ...process.env,
     GIT_SSH_COMMAND: sshCommand
   };
+}
+
+async function gitRemoteMatches(checkoutPath, remote) {
+  const wanted = normalizeRemote(remote);
+  if (!wanted || !fs.existsSync(path.join(checkoutPath, ".git"))) return false;
+  const result = await execFilePromise("git", ["-C", checkoutPath, "remote", "-v"], {
+    env: gitEnvForRemote("", remote)
+  });
+  if (!result.ok) return false;
+  return result.stdout.split(/\r?\n/).some((line) => normalizeRemote(line.split(/\s+/)[1]) === wanted);
+}
+
+async function findExistingCheckoutByRemote(remote) {
+  if (!remote || !fs.existsSync(WORKSPACES_DIR)) return null;
+  const entries = fs.readdirSync(WORKSPACES_DIR, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(WORKSPACES_DIR, entry.name);
+    if (await gitRemoteMatches(candidate, remote)) return candidate;
+  }
+  return null;
 }
 
 function defaultGithubRepoName(app) {
@@ -394,7 +419,7 @@ async function startGitSync(appId) {
       updateGitSync(appId, { status: "failed", message: access.error, error: access.error });
       return { ok: false, error: access.error };
     }
-    startWorkspaceClone(appId);
+    await startWorkspaceClone(appId);
     return { ok: true, alreadyReady: true };
   }
   if (!app.git?.present && !app.lastReport?.git?.present) {
@@ -462,7 +487,7 @@ async function startGitSync(appId) {
   return { ok: true };
 }
 
-function startWorkspaceClone(appId) {
+async function startWorkspaceClone(appId) {
   const app = store.getApp(appId);
   if (!app) return { ok: false, error: "Workspace not found." };
   if (activeCloneProcesses.has(appId)) return { ok: true, running: true };
@@ -498,6 +523,23 @@ function startWorkspaceClone(appId) {
       message: "Local checkout already exists."
     });
     return { ok: true, path: existing.path, alreadyReady: true };
+  }
+
+  const matchingCheckout = await findExistingCheckoutByRemote(remote);
+  if (matchingCheckout) {
+    store.updateWorkspace(appId, { localPath: matchingCheckout });
+    updateCloneStatus(appId, {
+      status: "ready",
+      remote,
+      path: matchingCheckout,
+      message: "Reused existing controller checkout for this Git remote."
+    });
+    updateGitSync(appId, {
+      status: "ready",
+      message: "GitHub sync ready. Reused existing controller checkout."
+    });
+    store.addWorkspaceTranscript(appId, "clone", `Reused existing controller checkout at ${matchingCheckout}\n`);
+    return { ok: true, path: matchingCheckout, alreadyReady: true, reused: true };
   }
 
   const targetPath = defaultWorkspacePath(app);
@@ -1335,7 +1377,7 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && workspaceCloneMatch) {
     const app = store.getApp(workspaceCloneMatch[1]);
     if (!app) return sendJson(res, 404, { error: "Workspace not found." });
-    startWorkspaceClone(app.id);
+    await startWorkspaceClone(app.id);
     return redirect(res, `/workspaces/${app.id}`);
   }
 
@@ -1465,7 +1507,7 @@ async function handleApi(req, res, url) {
     const savedPlan = store.recordSetupPlan(app.id, plan, mode);
     const split = actionsForMode(plan, mode);
     store.log("pair", `App paired: ${app.name}`, { appId: app.id, planId: plan.id, mode });
-    startWorkspaceClone(app.id);
+    await startWorkspaceClone(app.id);
     const pairedApp = store.getApp(app.id);
     return sendJson(res, 200, {
       app: { id: app.id, token: app.token, name: app.name, cloneStatus: pairedApp?.cloneStatus || app.cloneStatus },
@@ -1553,7 +1595,7 @@ async function handleApi(req, res, url) {
             remote: gitSync.sshUrl || command.sshUrl,
             message: "Replit pushed to GitHub. Controller clone queued."
           });
-          startWorkspaceClone(app.id);
+          await startWorkspaceClone(app.id);
         }
       }
       if (command?.taskId) {
@@ -1619,5 +1661,6 @@ module.exports = {
   gitEnvForRemote,
   githubDeployKeyPath,
   isGithubSshRemote,
-  parseGithubRemote
+  parseGithubRemote,
+  normalizeRemote
 };

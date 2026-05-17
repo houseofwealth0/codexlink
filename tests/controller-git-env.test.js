@@ -8,7 +8,7 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-link-controller-"))
 process.env.CODEX_LINK_DATA_DIR = dataDir;
 process.env.CODEX_LINK_PORT = "0";
 
-const { gitEnvForRemote, githubDeployKeyPath, isGithubSshRemote, parseGithubRemote } = require("../packages/controller/src/index");
+const { gitEnvForRemote, githubDeployKeyPath, isGithubSshRemote, parseGithubRemote, normalizeRemote } = require("../packages/controller/src/index");
 
 test("controller clone uses workspace deploy key for GitHub SSH remotes", () => {
   const appId = "app-123";
@@ -43,4 +43,15 @@ test("controller parses GitHub remotes for existing remote deploy key setup", ()
     owner: "houseofwealth0",
     repo: "example"
   });
+});
+
+test("controller normalizes clone-equivalent git remotes", () => {
+  assert.equal(
+    normalizeRemote("git@github.com:houseofwealth0/example.git"),
+    "git@github.com:houseofwealth0/example"
+  );
+  assert.equal(
+    normalizeRemote("git@github.com:houseofwealth0/example"),
+    "git@github.com:houseofwealth0/example"
+  );
 });
