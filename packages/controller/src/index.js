@@ -26,25 +26,47 @@ function execFilePromise(command, args, options = {}) {
 }
 
 function ghCommand() {
-  return process.env.CODEX_LINK_GH_BIN || "gh";
+  if (process.env.CODEX_LINK_GH_BIN) return process.env.CODEX_LINK_GH_BIN;
+  if (process.platform === "win32" && fs.existsSync("C:\\tmp\\gh\\bin\\gh.exe")) return "C:\\tmp\\gh\\bin\\gh.exe";
+  return "gh";
+}
+
+function powershellQuote(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
 }
 
 function openVisibleCommand(command, args = []) {
   if (process.platform === "win32") {
     return new Promise((resolve) => {
-      const psArgs = [
+      const psCommand = `& ${powershellQuote(command)} ${args.map(powershellQuote).join(" ")}`;
+      const child = spawn("cmd.exe", [
+        "/d",
+        "/s",
+        "/c",
+        "start",
+        "GitHub Login - Codex Link",
+        "powershell.exe",
         "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
         "-Command",
-        `& ${JSON.stringify(command)} ${args.map((arg) => JSON.stringify(arg)).join(" ")}`
-      ];
-      const child = spawn("powershell.exe", psArgs, {
+        psCommand
+      ], {
         detached: true,
         stdio: "ignore",
         windowsHide: false
       });
-      child.on("error", (error) => resolve({ ok: false, error: error.message }));
+      let settled = false;
+      child.on("error", (error) => {
+        settled = true;
+        resolve({ ok: false, error: error.message });
+      });
+      child.on("spawn", () => {
+        setTimeout(() => {
+          if (!settled) resolve({ ok: true, pid: child.pid });
+        }, 250).unref();
+      });
       child.unref();
-      resolve({ ok: true, pid: child.pid });
     });
   }
   const child = spawn(command, args, { detached: true, stdio: "ignore" });
@@ -157,6 +179,11 @@ function gitSyncNextAction(gitSync = {}) {
     default:
       return "Waiting for GitHub sync to start.";
   }
+}
+
+function needsGithubLogin(gitSync = {}) {
+  return gitSync.status === "github_login_started"
+    || (gitSync.status === "failed" && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || ""));
 }
 
 function renderGitSyncTimeline(gitSync = {}) {
@@ -827,6 +854,7 @@ async function workspacePage(appId, req) {
   const notes = app.notes || "";
   const localPath = app.localPath || "";
   const autoSyncAvailable = Boolean(hasInternalReplitGit(app) || gitSync.status === "internal_git_detected" || gitSync.status === "failed" || gitSync.status === "github_login_started");
+  const githubLoginCommand = `${ghCommand()} auth login`;
   const promptDisabled = pathStatus.ok ? "" : "disabled";
   const promptHint = pathStatus.ok
     ? `Codex will run locally in ${pathStatus.path}`
@@ -937,9 +965,10 @@ async function workspacePage(appId, req) {
           <div><strong>Remote</strong><br><code>${escapeHtml(gitSync.remoteName || "codexlink")}</code></div>
         </div>
         <ol id="git-sync-timeline" class="timeline">${renderGitSyncTimeline(gitSync)}</ol>
-        <form id="git-login-form" class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/github-login" ${gitSync.status === "failed" && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || "") ? "" : "hidden"}>
+        <form id="git-login-form" class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/github-login" ${needsGithubLogin(gitSync) ? "" : "hidden"}>
           <button type="submit">Open GitHub Login</button>
         </form>
+        <p id="git-login-fallback" class="muted" ${needsGithubLogin(gitSync) ? "" : "hidden"}>If no window appears, run this on this PC:<br><code>${escapeHtml(githubLoginCommand)}</code></p>
         <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/git-sync/start">
           <button id="git-sync-button" type="submit">${gitSync.status === "failed" ? "Retry GitHub Sync" : "Create / Connect GitHub Remote"}</button>
         </form>
@@ -1018,6 +1047,10 @@ async function workspacePage(appId, req) {
           return 'Waiting for GitHub sync to start.';
       }
     }
+    function needsGithubLogin(gitSync) {
+      return gitSync?.status === 'github_login_started'
+        || (gitSync?.status === 'failed' && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || ''));
+    }
     function renderGitTimeline(history) {
       const list = document.getElementById('git-sync-timeline');
       if (!list) return;
@@ -1076,6 +1109,7 @@ async function workspacePage(appId, req) {
         const gitRepo = document.getElementById('git-sync-repo');
         const gitBranch = document.getElementById('git-sync-branch');
         const loginForm = document.getElementById('git-login-form');
+        const loginFallback = document.getElementById('git-login-fallback');
         const syncButton = document.getElementById('git-sync-button');
         gitStatus.textContent = 'git: ' + (gitSync.status || 'unknown');
         gitStatus.className = 'pill ' + syncClass(gitSync.status);
@@ -1083,7 +1117,8 @@ async function workspacePage(appId, req) {
         gitNext.textContent = gitSyncNextAction(gitSync);
         gitRepo.textContent = gitSync.repoUrl || 'not created yet';
         gitBranch.textContent = gitSync.branch || initialGitBranch;
-        if (loginForm) loginForm.hidden = !(gitSync.status === 'failed' && /gh auth|GitHub CLI/i.test(gitSync.message || gitSync.error || ''));
+        if (loginForm) loginForm.hidden = !needsGithubLogin(gitSync);
+        if (loginFallback) loginFallback.hidden = !needsGithubLogin(gitSync);
         if (syncButton) syncButton.textContent = gitSync.status === 'failed' ? 'Retry GitHub Sync' : 'Create / Connect GitHub Remote';
         renderGitTimeline(gitSync.history);
       }
@@ -1252,7 +1287,7 @@ async function handleApi(req, res, url) {
     if (opened.ok) {
       updateGitSync(app.id, {
         status: "github_login_started",
-        message: "Opened GitHub login window. Complete it, then click Create / Connect GitHub Remote again.",
+        message: "Opening a visible GitHub login window. Complete it, then click Create / Connect GitHub Remote again.",
         error: null
       });
     } else {
