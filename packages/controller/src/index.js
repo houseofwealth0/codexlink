@@ -264,6 +264,34 @@ function updateGitSync(appId, patch) {
   return updated;
 }
 
+function githubDeployKeyPath(appId) {
+  return path.join(DATA_DIR, "github-keys", appId, "deploy_key");
+}
+
+function isGithubSshRemote(remote) {
+  return /^git@github\.com:/i.test(String(remote || ""))
+    || /^ssh:\/\/git@github\.com\//i.test(String(remote || ""));
+}
+
+function gitEnvForRemote(appId, remote) {
+  if (!isGithubSshRemote(remote)) return process.env;
+  const keyPath = githubDeployKeyPath(appId);
+  if (!fs.existsSync(keyPath)) return process.env;
+  const sshCommand = [
+    "ssh",
+    "-i",
+    keyPath,
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new"
+  ].map((part) => /\s/.test(part) ? `"${part.replaceAll('"', '\\"')}"` : part).join(" ");
+  return {
+    ...process.env,
+    GIT_SSH_COMMAND: sshCommand
+  };
+}
+
 function defaultGithubRepoName(app) {
   const report = app.lastReport || {};
   const replit = report.replit || {};
@@ -466,10 +494,13 @@ function startWorkspaceClone(appId) {
     message: "Cloning local checkout..."
   });
   store.addWorkspaceTranscript(appId, "clone", `Cloning ${remote} into ${targetPath}\n`);
+  if (isGithubSshRemote(remote) && fs.existsSync(githubDeployKeyPath(appId))) {
+    store.addWorkspaceTranscript(appId, "clone", "Using this workspace's GitHub deploy key for controller clone.\n");
+  }
 
   const child = spawn("git", ["clone", remote, targetPath], {
     cwd: WORKSPACES_DIR,
-    env: process.env,
+    env: gitEnvForRemote(appId, remote),
     shell: false
   });
   activeCloneProcesses.set(appId, child);
@@ -1533,12 +1564,20 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  store.log("controller", `Codex Link controller listening on ${BASE_URL}`);
-  console.log(`Codex Link controller listening on ${BASE_URL}`);
-  startTelegramBot({
-    token: process.env.TELEGRAM_BOT_TOKEN,
-    ownerChatId: process.env.TELEGRAM_OWNER_CHAT_ID,
-    store
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    store.log("controller", `Codex Link controller listening on ${BASE_URL}`);
+    console.log(`Codex Link controller listening on ${BASE_URL}`);
+    startTelegramBot({
+      token: process.env.TELEGRAM_BOT_TOKEN,
+      ownerChatId: process.env.TELEGRAM_OWNER_CHAT_ID,
+      store
+    });
   });
-});
+}
+
+module.exports = {
+  gitEnvForRemote,
+  githubDeployKeyPath,
+  isGithubSshRemote
+};
