@@ -104,3 +104,23 @@ test("store migration recovers internal Replit git from last report when top-lev
   assert.equal(recovered.gitSync.status, "internal_git_detected");
   assert.equal(session.transcript.some((event) => event.text.includes("Automatic clone skipped: no Git remote detected")), false);
 });
+
+test("store marks interrupted interactive terminal sessions resumable after controller restart", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-link-store-"));
+  const store = new Store(root);
+  const app = store.registerApp({ report: sampleReport(), controllerUrl: "http://localhost:8787", pairingCode: "ABC123" });
+  store.updateWorkspaceSession(app.id, {
+    status: "running",
+    mode: "interactive",
+    activePid: 12345
+  });
+  store.addWorkspaceTranscript(app.id, "terminal", "Codex TUI output");
+  store.save();
+
+  const reloaded = new Store(root);
+  const session = reloaded.getWorkspaceSession(app.id);
+
+  assert.equal(session.status, "resumable");
+  assert.equal(session.activePid, null);
+  assert.equal(session.mode, "interactive");
+});

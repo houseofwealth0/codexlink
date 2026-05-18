@@ -68,6 +68,21 @@ function codexInteractiveArgs(command, workspacePath) {
   ];
 }
 
+function codexResumeArgs(command, workspacePath) {
+  return [
+    ...codexBaseArgs(command),
+    "resume",
+    "--last",
+    "--cd",
+    workspacePath,
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen"
+  ];
+}
+
 function needsShell(command) {
   return process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
 }
@@ -743,7 +758,7 @@ function startCodexForWorkspace(appId, prompt) {
   return { ok: true, pid: child.pid };
 }
 
-function startInteractiveCodexForWorkspace(appId) {
+function startInteractiveCodexForWorkspace(appId, options = {}) {
   const app = store.getApp(appId);
   if (!app) return { ok: false, error: "Workspace not found." };
   if (!pty) return { ok: false, error: "Interactive terminal support is not installed. Run npm install first." };
@@ -752,14 +767,16 @@ function startInteractiveCodexForWorkspace(appId) {
   if (!validation.ok) return validation;
 
   const command = codexCommand();
-  const args = codexInteractiveArgs(command, validation.path);
+  const resume = Boolean(options.resume);
+  const args = resume ? codexResumeArgs(command, validation.path) : codexInteractiveArgs(command, validation.path);
   store.updateWorkspaceSession(appId, {
     status: "running",
     mode: "interactive",
+    lastStartMode: resume ? "resume" : "new",
     startedAt: new Date().toISOString(),
     stoppedAt: null
   });
-  store.addWorkspaceTranscript(appId, "system", `Starting interactive Codex terminal: ${command} ${args.join(" ")}`);
+  store.addWorkspaceTranscript(appId, "system", `${resume ? "Resuming" : "Starting"} interactive Codex terminal: ${command} ${args.join(" ")}`);
 
   let term;
   try {
@@ -1135,6 +1152,7 @@ async function workspacePage(appId, req) {
     : autoSyncAvailable
       ? "Codex will be enabled after GitHub Sync creates the local checkout automatically."
       : pathStatus.error;
+  const canResumeCodex = pathStatus.ok && session.mode === "interactive" && (session.transcript || []).some((event) => event.type === "terminal");
 
   return `<!doctype html>
 <html>
@@ -1225,9 +1243,14 @@ async function workspacePage(appId, req) {
         <div>
           <div class="header-row">
             <span class="muted">${escapeHtml(promptHint)}</span>
-            <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/terminal/start">
-              <button type="submit" ${promptDisabled}>Start Codex Terminal</button>
-            </form>
+            <div class="controls">
+              <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/terminal/start">
+                <button type="submit" ${promptDisabled}>Start New Terminal</button>
+              </form>
+              <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/terminal/resume">
+                <button class="secondary" type="submit" ${canResumeCodex ? "" : "disabled"}>Resume Previous Terminal</button>
+              </form>
+            </div>
           </div>
           <form id="terminal-input-form" class="terminal-input-row">
             <input id="terminal-input" class="terminal-input" ${promptDisabled} autocomplete="off" placeholder="Type to Codex, then press Enter" />
@@ -1644,6 +1667,15 @@ async function handleApi(req, res, url) {
     const app = store.getApp(workspaceTerminalStartMatch[1]);
     if (!app) return sendJson(res, 404, { error: "Workspace not found." });
     const started = startInteractiveCodexForWorkspace(app.id);
+    if (!started.ok) store.addWorkspaceTranscript(app.id, "error", started.error);
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceTerminalResumeMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/terminal\/resume$/);
+  if (req.method === "POST" && workspaceTerminalResumeMatch) {
+    const app = store.getApp(workspaceTerminalResumeMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    const started = startInteractiveCodexForWorkspace(app.id, { resume: true });
     if (!started.ok) store.addWorkspaceTranscript(app.id, "error", started.error);
     return redirect(res, `/workspaces/${app.id}`);
   }

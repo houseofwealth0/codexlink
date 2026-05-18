@@ -56,6 +56,15 @@ class Store {
     this.data.workspaceSessions ||= {};
     this.data.workerCommands ||= {};
     this.data.logs ||= [];
+    for (const session of Object.values(this.data.workspaceSessions)) {
+      session.mode ||= session.transcript?.some((event) => event.type === "terminal") ? "interactive" : session.mode;
+      if (["running", "stopping"].includes(session.status)) {
+        session.status = "resumable";
+        session.activePid = null;
+        session.stoppedAt ||= new Date().toISOString();
+        session.updatedAt = new Date().toISOString();
+      }
+    }
     for (const app of Object.values(this.data.apps)) {
       const internalReplitGit = hasInternalReplitGit(app);
       const externalGit = hasExternalGit(app);
