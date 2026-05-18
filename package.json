@@ -21,5 +21,9 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@homebridge/node-pty-prebuilt-multiarch": "^0.13.1",
+    "@xterm/xterm": "^6.0.0"
   }
 }

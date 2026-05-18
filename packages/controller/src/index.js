@@ -6,6 +6,12 @@ const { execFile, spawn } = require("child_process");
 const { Store } = require("./store");
 const { startTelegramBot } = require("./telegram");
 const { createSetupPlan, actionsForMode } = require("../../shared/src/setup-agent");
+let pty = null;
+try {
+  pty = require("@homebridge/node-pty-prebuilt-multiarch");
+} catch {
+  pty = null;
+}
 
 const PORT = Number(process.env.CODEX_LINK_PORT || 8787);
 const HOST = process.env.CODEX_LINK_HOST || "0.0.0.0";
@@ -34,7 +40,7 @@ function ghCommand() {
 function codexCommand() {
   if (process.env.CODEX_LINK_CODEX_BIN) return process.env.CODEX_LINK_CODEX_BIN;
   if (process.platform === "win32" && fs.existsSync("C:\\tmp\\codex-cli\\node_modules\\@openai\\codex\\bin\\codex.js")) {
-    return "node";
+    return process.execPath;
   }
   if (process.platform === "win32" && fs.existsSync("C:\\tmp\\codex-cli\\node_modules\\.bin\\codex.cmd")) {
     return "C:\\tmp\\codex-cli\\node_modules\\.bin\\codex.cmd";
@@ -43,10 +49,23 @@ function codexCommand() {
 }
 
 function codexBaseArgs(command) {
-  if (command === "node" && process.platform === "win32" && fs.existsSync("C:\\tmp\\codex-cli\\node_modules\\@openai\\codex\\bin\\codex.js")) {
+  if (command === process.execPath && process.platform === "win32" && fs.existsSync("C:\\tmp\\codex-cli\\node_modules\\@openai\\codex\\bin\\codex.js")) {
     return ["C:\\tmp\\codex-cli\\node_modules\\@openai\\codex\\bin\\codex.js"];
   }
   return [];
+}
+
+function codexInteractiveArgs(command, workspacePath) {
+  return [
+    ...codexBaseArgs(command),
+    "--cd",
+    workspacePath,
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "--no-alt-screen"
+  ];
 }
 
 function needsShell(command) {
@@ -724,6 +743,63 @@ function startCodexForWorkspace(appId, prompt) {
   return { ok: true, pid: child.pid };
 }
 
+function startInteractiveCodexForWorkspace(appId) {
+  const app = store.getApp(appId);
+  if (!app) return { ok: false, error: "Workspace not found." };
+  if (!pty) return { ok: false, error: "Interactive terminal support is not installed. Run npm install first." };
+  if (activeWorkspaceProcesses.has(appId)) return { ok: false, error: "Codex is already running for this workspace." };
+  const validation = validateLocalPath(app.localPath);
+  if (!validation.ok) return validation;
+
+  const command = codexCommand();
+  const args = codexInteractiveArgs(command, validation.path);
+  store.updateWorkspaceSession(appId, {
+    status: "running",
+    mode: "interactive",
+    startedAt: new Date().toISOString(),
+    stoppedAt: null
+  });
+  store.addWorkspaceTranscript(appId, "system", `Starting interactive Codex terminal: ${command} ${args.join(" ")}`);
+
+  let term;
+  try {
+    term = pty.spawn(command, args, {
+      name: "xterm-256color",
+      cols: 120,
+      rows: 32,
+      cwd: validation.path,
+      env: process.env
+    });
+  } catch (error) {
+    store.addWorkspaceTranscript(appId, "error", `Codex terminal failed to start: ${error.message}`);
+    store.updateWorkspaceSession(appId, { status: "failed", activePid: null, stoppedAt: new Date().toISOString() });
+    return { ok: false, error: error.message };
+  }
+  activeWorkspaceProcesses.set(appId, { type: "pty", process: term });
+  store.updateWorkspaceSession(appId, { activePid: term.pid });
+
+  term.onData((data) => {
+    store.addWorkspaceTranscript(appId, "terminal", data);
+  });
+  term.onExit(({ exitCode, signal }) => {
+    store.addWorkspaceTranscript(appId, "system", `Codex terminal exited with code ${exitCode ?? "null"}${signal ? ` signal ${signal}` : ""}.`);
+    store.updateWorkspaceSession(appId, {
+      status: exitCode === 0 ? "idle" : "failed",
+      activePid: null,
+      stoppedAt: new Date().toISOString()
+    });
+    activeWorkspaceProcesses.delete(appId);
+  });
+  return { ok: true, pid: term.pid };
+}
+
+function writeInteractiveCodexInput(appId, input) {
+  const active = activeWorkspaceProcesses.get(appId);
+  if (!active || active.type !== "pty") return { ok: false, error: "No interactive Codex terminal is running." };
+  active.process.write(input);
+  return { ok: true };
+}
+
 async function publishWorkspaceChanges(appId) {
   const app = store.getApp(appId);
   if (!app) return { ok: false, error: "Workspace not found." };
@@ -762,12 +838,13 @@ async function publishWorkspaceChanges(appId) {
 }
 
 function stopCodexForWorkspace(appId) {
-  const child = activeWorkspaceProcesses.get(appId);
-  if (!child) {
+  const active = activeWorkspaceProcesses.get(appId);
+  if (!active) {
     store.updateWorkspaceSession(appId, { status: "idle", activePid: null, stoppedAt: new Date().toISOString() });
     return { ok: true, stopped: false };
   }
-  child.kill();
+  if (active.type === "pty") active.process.kill();
+  else active.kill();
   activeWorkspaceProcesses.delete(appId);
   store.addWorkspaceTranscript(appId, "system", "Stop requested.");
   store.updateWorkspaceSession(appId, { status: "stopping", activePid: null, stoppedAt: new Date().toISOString() });
@@ -1065,6 +1142,7 @@ async function workspacePage(appId, req) {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(workspaceName(app))} - Codex Link</title>
+  <link rel="stylesheet" href="/assets/xterm.css">
   <style>
     :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; background: #f7f8fb; color: #1b1f2a; }
@@ -1081,8 +1159,11 @@ async function workspacePage(appId, req) {
     .danger { background: #b42318; }
     .secondary { background: #475467; }
     .header-row, .controls { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-    .terminal-wrap { display: grid; grid-template-rows: minmax(360px, 62vh) auto; overflow: hidden; }
-    #terminal { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; overflow-y: auto; background: #0d1117; color: #e6edf3; padding: 14px; border-radius: 8px; font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .terminal-wrap { display: grid; grid-template-rows: minmax(420px, 66vh) auto; overflow: hidden; }
+    #terminal { overflow: hidden; background: #0d1117; border-radius: 8px; padding: 8px; }
+    #terminal .xterm { height: 100%; }
+    .terminal-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; margin-top: 12px; }
+    .terminal-input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     .prompt-form { display: grid; gap: 10px; margin-top: 12px; }
     .side { display: grid; gap: 14px; }
     .meta { display: grid; gap: 8px; font-size: 14px; }
@@ -1140,16 +1221,19 @@ async function workspacePage(appId, req) {
     <section>
       <h2>Live Codex Terminal</h2>
       <div class="terminal-wrap">
-        <pre id="terminal"></pre>
-        <form class="prompt-form" method="post" action="/workspaces/${escapeHtml(app.id)}/prompt">
-          <label>Prompt
-            <textarea name="prompt" rows="4" ${promptDisabled} placeholder="Tell Codex what to do in this workspace..."></textarea>
-          </label>
+        <div id="terminal"></div>
+        <div>
           <div class="header-row">
             <span class="muted">${escapeHtml(promptHint)}</span>
-            <button type="submit" ${promptDisabled}>Start Codex Run</button>
+            <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/terminal/start">
+              <button type="submit" ${promptDisabled}>Start Codex Terminal</button>
+            </form>
           </div>
-        </form>
+          <form id="terminal-input-form" class="terminal-input-row">
+            <input id="terminal-input" class="terminal-input" ${promptDisabled} autocomplete="off" placeholder="Type to Codex, then press Enter" />
+            <button type="submit" ${promptDisabled}>Send</button>
+          </form>
+        </div>
       </div>
     </section>
     <aside class="side">
@@ -1212,9 +1296,20 @@ async function workspacePage(appId, req) {
       </section>
     </aside>
   </main>
+  <script src="/assets/xterm.js"></script>
   <script>
-    const terminal = document.getElementById('terminal');
+    const terminalEl = document.getElementById('terminal');
+    const terminal = new Terminal({
+      convertEol: true,
+      cursorBlink: true,
+      fontFamily: 'Consolas, "Cascadia Mono", "SFMono-Regular", monospace',
+      fontSize: 13,
+      theme: { background: '#0d1117', foreground: '#e6edf3' }
+    });
+    terminal.open(terminalEl);
     const status = document.getElementById('session-status');
+    const inputForm = document.getElementById('terminal-input-form');
+    const input = document.getElementById('terminal-input');
     const initialGitBranch = ${JSON.stringify(git.branch || "not selected yet")};
     function syncClass(syncStatus) {
       if (syncStatus === 'ready' || syncStatus === 'github_login_started') return 'online';
@@ -1282,11 +1377,24 @@ async function workspacePage(appId, req) {
     }
     function appendEvent(event) {
       const when = new Date(event.createdAt).toLocaleTimeString();
+      if (event.type === 'terminal') {
+        terminal.write(event.text);
+        return;
+      }
       const prefix = '[' + when + '] ' + event.type + ': ';
-      terminal.textContent += prefix + event.text;
-      if (!event.text.endsWith('\\n')) terminal.textContent += '\\n';
-      terminal.scrollTop = terminal.scrollHeight;
+      terminal.writeln(prefix + event.text.replace(/\\n$/, ''));
     }
+    inputForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const value = input.value;
+      if (!value.trim()) return;
+      input.value = '';
+      await fetch('/workspaces/${escapeHtml(app.id)}/terminal/input', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ input: value + '\\r' })
+      });
+    });
     const source = new EventSource('/workspaces/${escapeHtml(app.id)}/events');
     source.onmessage = (message) => {
       const payload = JSON.parse(message.data);
@@ -1388,6 +1496,21 @@ function workspaceSse(req, res, appId) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/assets/xterm.js") {
+    const filePath = path.join(process.cwd(), "node_modules", "@xterm", "xterm", "lib", "xterm.js");
+    if (!fs.existsSync(filePath)) return sendJson(res, 404, { error: "xterm.js is not installed." });
+    res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-store" });
+    res.end(fs.readFileSync(filePath, "utf8"));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/assets/xterm.css") {
+    const filePath = path.join(process.cwd(), "node_modules", "@xterm", "xterm", "css", "xterm.css");
+    if (!fs.existsSync(filePath)) return sendJson(res, 404, { error: "xterm.css is not installed." });
+    res.writeHead(200, { "content-type": "text/css; charset=utf-8", "cache-control": "no-store" });
+    res.end(fs.readFileSync(filePath, "utf8"));
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/apps") return sendJson(res, 200, { apps: store.listApps() });
   if (req.method === "GET" && url.pathname === "/api/tasks") return sendJson(res, 200, { tasks: store.listTasks() });
   if (req.method === "GET" && url.pathname === "/api/tunnel") return sendJson(res, 200, { publicUrl: await detectPublicTunnelUrl() });
@@ -1514,6 +1637,30 @@ async function handleApi(req, res, url) {
     const started = startCodexForWorkspace(app.id, prompt);
     if (!started.ok) store.addWorkspaceTranscript(app.id, "error", started.error);
     return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceTerminalStartMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/terminal\/start$/);
+  if (req.method === "POST" && workspaceTerminalStartMatch) {
+    const app = store.getApp(workspaceTerminalStartMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    const started = startInteractiveCodexForWorkspace(app.id);
+    if (!started.ok) store.addWorkspaceTranscript(app.id, "error", started.error);
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
+  const workspaceTerminalInputMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/terminal\/input$/);
+  if (req.method === "POST" && workspaceTerminalInputMatch) {
+    const app = store.getApp(workspaceTerminalInputMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    const body = await readBody(req);
+    const input = String(body.input || "");
+    if (!input) return sendJson(res, 400, { error: "Input is required." });
+    const written = writeInteractiveCodexInput(app.id, input);
+    if (!written.ok) {
+      store.addWorkspaceTranscript(app.id, "error", written.error);
+      return sendJson(res, 409, { error: written.error });
+    }
+    return sendJson(res, 200, { ok: true });
   }
 
   const workspacePublishMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/publish$/);
@@ -1753,6 +1900,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (url.pathname.startsWith("/api/")
+      || url.pathname.startsWith("/assets/")
       || url.pathname === "/pairing-code"
       || url.pathname === "/shutdown"
       || url.pathname.startsWith("/tasks")
