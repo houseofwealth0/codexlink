@@ -83,6 +83,14 @@ async function git(root, args, env) {
   return runCommand(process.env.CODEX_LINK_GIT_BIN || "git", args, root, { env: { ...process.env, ...env } });
 }
 
+function githubDeployKeyEnv(root) {
+  const keyPath = path.join(root, ".codex-link", "github_deploy_key");
+  if (!fs.existsSync(keyPath)) return {};
+  return {
+    GIT_SSH_COMMAND: `ssh -i ${keyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`
+  };
+}
+
 async function configureGithubRemote(command, root) {
   const dir = path.join(root, ".codex-link");
   fs.mkdirSync(dir, { recursive: true });
@@ -134,12 +142,34 @@ async function configureGithubRemote(command, root) {
   return redactResult({ ok: true, remoteName, branch, steps, stdout: result.stdout, stderr: result.stderr });
 }
 
+async function pullFromGithub(command, root) {
+  const remoteName = command.remoteName || "codexlink";
+  const branch = command.branch || "main";
+  const gitEnv = githubDeployKeyEnv(root);
+  if (!gitEnv.GIT_SSH_COMMAND) {
+    return { ok: false, step: "deploy-key", error: "GitHub deploy key is missing in .codex-link/github_deploy_key." };
+  }
+  const result = await git(root, ["pull", "--rebase", "--autostash", remoteName, branch], gitEnv);
+  return redactResult({
+    ok: result.ok,
+    step: "pull",
+    remoteName,
+    branch,
+    code: result.code,
+    stdout: result.stdout,
+    stderr: result.stderr
+  });
+}
+
 async function handleCommand(command, root) {
   if (command.type === "run_command") {
     return runCommand(command.command, command.args || [], root);
   }
   if (command.type === "configure_github_remote") {
     return configureGithubRemote(command, root);
+  }
+  if (command.type === "pull_from_github") {
+    return pullFromGithub(command, root);
   }
   return { ok: false, error: `Unknown command type ${command.type}` };
 }
@@ -202,4 +232,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, heartbeat, handleCommand, configureGithubRemote };
+module.exports = { main, heartbeat, handleCommand, configureGithubRemote, pullFromGithub };

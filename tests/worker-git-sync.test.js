@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { configureGithubRemote } = require("../packages/worker/src/worker");
+const { configureGithubRemote, pullFromGithub } = require("../packages/worker/src/worker");
 
 function makeFakeGit(root) {
   const bin = path.join(root, "bin");
@@ -58,6 +58,34 @@ test("configure_github_remote writes deploy key, ignores codex-link files, pushe
     assert.match(log, /commit -m Codex Link bootstrap snapshot/);
     assert.match(log, /push -u codexlink HEAD:main/);
     assert.doesNotMatch(JSON.stringify(result), /secret|OPENSSH PRIVATE KEY/);
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldLog === undefined) delete process.env.FAKE_GIT_LOG;
+    else process.env.FAKE_GIT_LOG = oldLog;
+    if (oldGitBin === undefined) delete process.env.CODEX_LINK_GIT_BIN;
+    else process.env.CODEX_LINK_GIT_BIN = oldGitBin;
+  }
+});
+
+test("pull_from_github uses the stored deploy key and rebases from codexlink remote", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-link-worker-pull-"));
+  const fakeGit = makeFakeGit(root);
+  const keyDir = path.join(root, ".codex-link");
+  fs.mkdirSync(keyDir, { recursive: true });
+  fs.writeFileSync(path.join(keyDir, "github_deploy_key"), "private-key\n");
+  const oldPath = process.env.PATH;
+  const oldLog = process.env.FAKE_GIT_LOG;
+  const oldGitBin = process.env.CODEX_LINK_GIT_BIN;
+  process.env.PATH = `${fakeGit.bin}${path.delimiter}${oldPath}`;
+  process.env.FAKE_GIT_LOG = fakeGit.logPath;
+  process.env.CODEX_LINK_GIT_BIN = fakeGit.gitPath;
+  try {
+    const result = await pullFromGithub({ remoteName: "codexlink", branch: "main" }, root);
+
+    assert.equal(result.ok, true);
+    const log = fs.readFileSync(fakeGit.logPath, "utf8");
+    assert.match(log, /pull --rebase --autostash codexlink main/);
+    assert.doesNotMatch(JSON.stringify(result), /private-key|OPENSSH PRIVATE KEY/);
   } finally {
     process.env.PATH = oldPath;
     if (oldLog === undefined) delete process.env.FAKE_GIT_LOG;

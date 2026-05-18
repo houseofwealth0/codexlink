@@ -19,7 +19,7 @@ const activeCloneProcesses = new Map();
 
 function execFilePromise(command, args, options = {}) {
   return new Promise((resolve) => {
-    execFile(command, args, { encoding: "utf8", maxBuffer: 1024 * 1024, ...options }, (error, stdout, stderr) => {
+    execFile(command, args, { encoding: "utf8", maxBuffer: 1024 * 1024, shell: needsShell(command), ...options }, (error, stdout, stderr) => {
       resolve({ ok: !error, code: error?.code || 0, stdout: stdout || "", stderr: stderr || "", error });
     });
   });
@@ -29,6 +29,52 @@ function ghCommand() {
   if (process.env.CODEX_LINK_GH_BIN) return process.env.CODEX_LINK_GH_BIN;
   if (process.platform === "win32" && fs.existsSync("C:\\tmp\\gh\\bin\\gh.exe")) return "C:\\tmp\\gh\\bin\\gh.exe";
   return "gh";
+}
+
+function codexCommand() {
+  if (process.env.CODEX_LINK_CODEX_BIN) return process.env.CODEX_LINK_CODEX_BIN;
+  if (process.platform === "win32" && fs.existsSync("C:\\tmp\\codex-cli\\node_modules\\@openai\\codex\\bin\\codex.js")) {
+    return "node";
+  }
+  if (process.platform === "win32" && fs.existsSync("C:\\tmp\\codex-cli\\node_modules\\.bin\\codex.cmd")) {
+    return "C:\\tmp\\codex-cli\\node_modules\\.bin\\codex.cmd";
+  }
+  return "codex";
+}
+
+function codexBaseArgs(command) {
+  if (command === "node" && process.platform === "win32" && fs.existsSync("C:\\tmp\\codex-cli\\node_modules\\@openai\\codex\\bin\\codex.js")) {
+    return ["C:\\tmp\\codex-cli\\node_modules\\@openai\\codex\\bin\\codex.js"];
+  }
+  return [];
+}
+
+function needsShell(command) {
+  return process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
+}
+
+function gitArgs(repoPath, args) {
+  return ["-c", `safe.directory=${repoPath}`, ...args];
+}
+
+function queueWorkerPull(appId, remoteName, branch) {
+  store.enqueueWorkerCommand(appId, {
+    type: "pull_from_github",
+    remoteName,
+    branch
+  });
+  store.addWorkspaceTranscript(appId, "publish", "Queued Replit worker to pull the GitHub update.\n");
+}
+
+function queueLegacyWorkerPull(appId, remoteName, branch) {
+  const sshCommand = "ssh -i .codex-link/github_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new";
+  store.enqueueWorkerCommand(appId, {
+    type: "run_command",
+    purpose: "pull_from_github_fallback",
+    command: "sh",
+    args: ["-lc", `GIT_SSH_COMMAND=${JSON.stringify(sshCommand)} git pull --rebase --autostash ${remoteName} ${branch}`]
+  });
+  store.addWorkspaceTranscript(appId, "publish", "Queued legacy Replit worker Git pull fallback.\n");
 }
 
 function powershellQuote(value) {
@@ -637,18 +683,20 @@ function startCodexForWorkspace(appId, prompt) {
   const validation = validateLocalPath(app.localPath);
   if (!validation.ok) return validation;
 
-  const args = ["exec", "--cd", validation.path, "--ask-for-approval", "never", prompt];
+  const command = codexCommand();
+  const args = [...codexBaseArgs(command), "exec", "--cd", validation.path, "--sandbox", "workspace-write", prompt];
   store.updateWorkspaceSession(appId, {
     status: "running",
     startedAt: new Date().toISOString(),
     stoppedAt: null
   });
-  store.addWorkspaceTranscript(appId, "system", `Starting: codex ${args.join(" ")}`);
+  store.addWorkspaceTranscript(appId, "system", `Starting: ${command} ${args.join(" ")}`);
 
-  const child = spawn("codex", args, {
+  const child = spawn(command, args, {
     cwd: validation.path,
     env: process.env,
-    shell: false
+    shell: needsShell(command),
+    stdio: ["ignore", "pipe", "pipe"]
   });
   activeWorkspaceProcesses.set(appId, child);
   store.updateWorkspaceSession(appId, { activePid: child.pid });
@@ -674,6 +722,43 @@ function startCodexForWorkspace(appId, prompt) {
     activeWorkspaceProcesses.delete(appId);
   });
   return { ok: true, pid: child.pid };
+}
+
+async function publishWorkspaceChanges(appId) {
+  const app = store.getApp(appId);
+  if (!app) return { ok: false, error: "Workspace not found." };
+  const validation = validateLocalPath(app.localPath);
+  if (!validation.ok) return validation;
+  const remote = app.git?.externalRemote?.url || app.git?.remote || app.gitSync?.sshUrl || app.cloneStatus?.remote;
+  if (!remote) return { ok: false, error: "No Git remote configured for publishing." };
+  const branch = app.gitSync?.branch || app.git?.branch || "main";
+  const remoteName = app.git?.remoteName || app.gitSync?.remoteName || "codexlink";
+  const env = gitEnvForRemote(appId, remote);
+
+  store.addWorkspaceTranscript(appId, "publish", "Publishing local Codex changes to GitHub...\n");
+  await execFilePromise("git", gitArgs(validation.path, ["config", "user.name", "Codex Link"]), { cwd: validation.path });
+  await execFilePromise("git", gitArgs(validation.path, ["config", "user.email", "codex-link@local"]), { cwd: validation.path });
+
+  const status = await execFilePromise("git", gitArgs(validation.path, ["status", "--porcelain"]), { cwd: validation.path });
+  if (!status.ok) return { ok: false, error: status.stderr || status.stdout || "Could not read Git status." };
+  if (!status.stdout.trim()) {
+    store.addWorkspaceTranscript(appId, "publish", "No local changes to publish. Re-queuing Replit pull check.\n");
+    queueWorkerPull(appId, remoteName, branch);
+    return { ok: true, skipped: true };
+  }
+
+  let result = await execFilePromise("git", gitArgs(validation.path, ["add", "-A"]), { cwd: validation.path });
+  if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git add failed." };
+  result = await execFilePromise("git", gitArgs(validation.path, ["commit", "-m", "Codex Link task update"]), { cwd: validation.path });
+  if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git commit failed." };
+  store.addWorkspaceTranscript(appId, "publish", result.stdout || "Committed local changes.\n");
+
+  result = await execFilePromise("git", gitArgs(validation.path, ["push", "origin", `HEAD:${branch}`]), { cwd: validation.path, env });
+  if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git push failed." };
+  store.addWorkspaceTranscript(appId, "publish", result.stdout || result.stderr || "Pushed local changes to GitHub.\n");
+
+  queueWorkerPull(appId, remoteName, branch);
+  return { ok: true };
 }
 
 function stopCodexForWorkspace(appId) {
@@ -1039,6 +1124,9 @@ async function workspacePage(appId, req) {
         <p><span class="pill ${online ? "online" : "offline"}">${online ? "worker online" : "worker offline"}</span> <span id="session-status" class="pill">${escapeHtml(session.status)}</span> <span id="git-sync-status" class="pill ${escapeHtml(statusClass(gitSync.status))}">git: ${escapeHtml(gitSync.status || "unknown")}</span> <span id="clone-status" class="pill ${cloneClass}">clone: ${escapeHtml(clone.status || "unknown")}</span></p>
       </div>
       <div class="controls">
+        <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/publish">
+          <button type="submit" ${pathStatus.ok ? "" : "disabled"}>Publish to Replit</button>
+        </form>
         <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/clear" onsubmit="return confirm('Clear this workspace transcript?');">
           <button class="secondary" type="submit">Clear Transcript</button>
         </form>
@@ -1428,6 +1516,15 @@ async function handleApi(req, res, url) {
     return redirect(res, `/workspaces/${app.id}`);
   }
 
+  const workspacePublishMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/publish$/);
+  if (req.method === "POST" && workspacePublishMatch) {
+    const app = store.getApp(workspacePublishMatch[1]);
+    if (!app) return sendJson(res, 404, { error: "Workspace not found." });
+    const result = await publishWorkspaceChanges(app.id);
+    if (!result.ok) store.addWorkspaceTranscript(app.id, "error", `Publish failed: ${result.error}`);
+    return redirect(res, `/workspaces/${app.id}`);
+  }
+
   const workspaceStopMatch = url.pathname.match(/^\/workspaces\/([^/]+)\/stop$/);
   if (req.method === "POST" && workspaceStopMatch) {
     const app = store.getApp(workspaceStopMatch[1]);
@@ -1557,6 +1654,8 @@ async function handleApi(req, res, url) {
           status: "replit_pushing",
           message: "Replit worker received the GitHub remote setup command."
         });
+      } else if (command.type === "pull_from_github") {
+        store.addWorkspaceTranscript(app.id, "publish", "Sent GitHub pull command to Replit worker.\n");
       }
     }
     return sendJson(res, 200, { ok: true, commands });
@@ -1596,6 +1695,25 @@ async function handleApi(req, res, url) {
             message: "Replit pushed to GitHub. Controller clone queued."
           });
           await startWorkspaceClone(app.id);
+        }
+      }
+      if (command?.type === "pull_from_github") {
+        const output = [item.result?.stdout, item.result?.stderr, item.result?.error].filter(Boolean).join("\n").trim();
+        if (item.result?.ok === false) {
+          store.addWorkspaceTranscript(app.id, "error", `Replit pull failed: ${output || "unknown error"}`);
+          if (/Unknown command type pull_from_github/i.test(output)) {
+            queueLegacyWorkerPull(app.id, command.remoteName || "codexlink", command.branch || "main");
+          }
+        } else {
+          store.addWorkspaceTranscript(app.id, "publish", output || "Replit worker pulled the GitHub update.\n");
+        }
+      }
+      if (command?.purpose === "pull_from_github_fallback") {
+        const output = [item.result?.stdout, item.result?.stderr, item.result?.error].filter(Boolean).join("\n").trim();
+        if (item.result?.ok === false) {
+          store.addWorkspaceTranscript(app.id, "error", `Legacy Replit pull failed: ${output || "unknown error"}`);
+        } else {
+          store.addWorkspaceTranscript(app.id, "publish", output || "Legacy Replit worker pulled the GitHub update.\n");
         }
       }
       if (command?.taskId) {
