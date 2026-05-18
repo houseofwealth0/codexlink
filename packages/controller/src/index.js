@@ -377,6 +377,31 @@ function githubDeployKeyPath(appId) {
   return path.join(DATA_DIR, "github-keys", appId, "deploy_key");
 }
 
+function remoteCandidatesForApp(app) {
+  return [
+    app?.git?.externalRemote?.url,
+    app?.git?.remote,
+    app?.gitSync?.sshUrl,
+    app?.cloneStatus?.remote,
+    app?.lastReport?.git?.externalRemote?.url,
+    app?.lastReport?.git?.remote
+  ].filter(Boolean);
+}
+
+function githubDeployKeyPathForRemote(appId, remote) {
+  const direct = githubDeployKeyPath(appId);
+  if (fs.existsSync(direct)) return direct;
+  const wanted = normalizeRemote(remote);
+  if (!wanted) return direct;
+  for (const app of store.listApps()) {
+    if (app.id === appId) continue;
+    if (!remoteCandidatesForApp(app).some((candidate) => normalizeRemote(candidate) === wanted)) continue;
+    const candidateKey = githubDeployKeyPath(app.id);
+    if (fs.existsSync(candidateKey)) return candidateKey;
+  }
+  return direct;
+}
+
 function isGithubSshRemote(remote) {
   return /^git@github\.com:/i.test(String(remote || ""))
     || /^ssh:\/\/git@github\.com\//i.test(String(remote || ""));
@@ -395,7 +420,7 @@ function parseGithubRemote(remote) {
 
 function gitEnvForRemote(appId, remote) {
   if (!isGithubSshRemote(remote)) return process.env;
-  const keyPath = githubDeployKeyPath(appId);
+  const keyPath = githubDeployKeyPathForRemote(appId, remote);
   if (!fs.existsSync(keyPath)) return process.env;
   securePrivateKeyPermissions(keyPath);
   const sshCommand = [
@@ -682,7 +707,7 @@ async function startWorkspaceClone(appId) {
     message: "Cloning local checkout..."
   });
   store.addWorkspaceTranscript(appId, "clone", `Cloning ${remote} into ${targetPath}\n`);
-  if (isGithubSshRemote(remote) && fs.existsSync(githubDeployKeyPath(appId))) {
+  if (isGithubSshRemote(remote) && fs.existsSync(githubDeployKeyPathForRemote(appId, remote))) {
     store.addWorkspaceTranscript(appId, "clone", "Using this workspace's GitHub deploy key for controller clone.\n");
   }
 
@@ -888,7 +913,7 @@ async function publishWorkspaceChanges(appId) {
     store.addWorkspaceTranscript(appId, "publish", "No uncommitted local files. Checking whether committed work still needs to push.\n");
   }
 
-  if (isGithubSshRemote(remote) && fs.existsSync(githubDeployKeyPath(appId))) {
+  if (isGithubSshRemote(remote) && fs.existsSync(githubDeployKeyPathForRemote(appId, remote))) {
     store.addWorkspaceTranscript(appId, "publish", "Using this workspace's GitHub deploy key for publish.\n");
   }
   result = await execFilePromise("git", gitArgs(validation.path, ["push", remote, `HEAD:${branch}`]), { cwd: validation.path, env });
