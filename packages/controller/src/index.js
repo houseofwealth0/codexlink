@@ -2,7 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { execFile, spawn } = require("child_process");
+const { execFile, execFileSync, spawn } = require("child_process");
 const { Store } = require("./store");
 const { startTelegramBot } = require("./telegram");
 const { createSetupPlan, actionsForMode } = require("../../shared/src/setup-agent");
@@ -89,6 +89,31 @@ function needsShell(command) {
 
 function gitArgs(repoPath, args) {
   return ["-c", `safe.directory=${repoPath}`, ...args];
+}
+
+function securePrivateKeyPermissions(keyPath) {
+  try {
+    fs.chmodSync(keyPath, 0o600);
+  } catch {
+    // Best effort; Windows needs ACL cleanup below.
+  }
+  if (process.platform !== "win32") return;
+  let user = null;
+  try {
+    user = execFileSync("whoami", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    user = process.env.USERDOMAIN && process.env.USERNAME
+      ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
+      : process.env.USERNAME;
+  }
+  if (!user) return;
+  try {
+    execFileSync("icacls", [keyPath, "/inheritance:r"], { stdio: "ignore" });
+    execFileSync("icacls", [keyPath, "/remove:g", "BUILTIN\\Administrators", "NT AUTHORITY\\SYSTEM", "Everyone", "Users"], { stdio: "ignore" });
+    execFileSync("icacls", [keyPath, "/grant:r", `${user}:F`], { stdio: "ignore" });
+  } catch {
+    // If icacls is unavailable, the later git command will surface the SSH error.
+  }
 }
 
 function queueWorkerPull(appId, remoteName, branch) {
@@ -372,6 +397,7 @@ function gitEnvForRemote(appId, remote) {
   if (!isGithubSshRemote(remote)) return process.env;
   const keyPath = githubDeployKeyPath(appId);
   if (!fs.existsSync(keyPath)) return process.env;
+  securePrivateKeyPermissions(keyPath);
   const sshCommand = [
     "ssh",
     "-i",
@@ -450,6 +476,7 @@ async function ensureDeployKey(appId, owner, repo) {
     const keygen = await execFilePromise("ssh-keygen", ["-t", "ed25519", "-N", "", "-C", `codex-link-${appId}`, "-f", keyPath]);
     if (!keygen.ok) return { ok: false, error: keygen.stderr || keygen.stdout || "ssh-keygen failed." };
   }
+  securePrivateKeyPermissions(keyPath);
   const publicKey = fs.readFileSync(publicKeyPath, "utf8").trim();
   const privateKey = fs.readFileSync(keyPath, "utf8");
   const title = `Codex Link ${appId.slice(0, 8)}`;
@@ -850,19 +877,21 @@ async function publishWorkspaceChanges(appId) {
 
   const status = await execFilePromise("git", gitArgs(validation.path, ["status", "--porcelain"]), { cwd: validation.path });
   if (!status.ok) return { ok: false, error: status.stderr || status.stdout || "Could not read Git status." };
-  if (!status.stdout.trim()) {
-    store.addWorkspaceTranscript(appId, "publish", "No local changes to publish. Re-queuing Replit pull check.\n");
-    queueWorkerPull(appId, remoteName, branch);
-    return { ok: true, skipped: true };
+  let result = null;
+  if (status.stdout.trim()) {
+    result = await execFilePromise("git", gitArgs(validation.path, ["add", "-A"]), { cwd: validation.path });
+    if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git add failed." };
+    result = await execFilePromise("git", gitArgs(validation.path, ["commit", "-m", "Codex Link task update"]), { cwd: validation.path });
+    if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git commit failed." };
+    store.addWorkspaceTranscript(appId, "publish", result.stdout || "Committed local changes.\n");
+  } else {
+    store.addWorkspaceTranscript(appId, "publish", "No uncommitted local files. Checking whether committed work still needs to push.\n");
   }
 
-  let result = await execFilePromise("git", gitArgs(validation.path, ["add", "-A"]), { cwd: validation.path });
-  if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git add failed." };
-  result = await execFilePromise("git", gitArgs(validation.path, ["commit", "-m", "Codex Link task update"]), { cwd: validation.path });
-  if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git commit failed." };
-  store.addWorkspaceTranscript(appId, "publish", result.stdout || "Committed local changes.\n");
-
-  result = await execFilePromise("git", gitArgs(validation.path, ["push", "origin", `HEAD:${branch}`]), { cwd: validation.path, env });
+  if (isGithubSshRemote(remote) && fs.existsSync(githubDeployKeyPath(appId))) {
+    store.addWorkspaceTranscript(appId, "publish", "Using this workspace's GitHub deploy key for publish.\n");
+  }
+  result = await execFilePromise("git", gitArgs(validation.path, ["push", remote, `HEAD:${branch}`]), { cwd: validation.path, env });
   if (!result.ok) return { ok: false, error: result.stderr || result.stdout || "git push failed." };
   store.addWorkspaceTranscript(appId, "publish", result.stdout || result.stderr || "Pushed local changes to GitHub.\n");
 
@@ -1391,10 +1420,12 @@ async function workspacePage(appId, req) {
     const terminalError = document.getElementById('terminal-error');
     const fallbackToggle = document.getElementById('fallback-toggle');
     const terminal = new Terminal({
-      convertEol: true,
+      convertEol: false,
       cursorBlink: true,
       fontFamily: 'Consolas, "Cascadia Mono", "SFMono-Regular", monospace',
       fontSize: 13,
+      rows: 28,
+      cols: 120,
       theme: { background: '#0d1117', foreground: '#e6edf3' }
     });
     terminal.open(terminalEl);
@@ -1404,7 +1435,9 @@ async function workspacePage(appId, req) {
     const initialGitBranch = ${JSON.stringify(git.branch || "not selected yet")};
     let terminalStatus = ${JSON.stringify(session.status || "idle")};
     let hasWrittenPreviousMarker = false;
-    let sendingInput = Promise.resolve();
+    let inputBuffer = '';
+    let inputFlushTimer = null;
+    let flushingInput = false;
     function syncClass(syncStatus) {
       if (syncStatus === 'ready' || syncStatus === 'github_login_started') return 'online';
       if (syncStatus === 'failed' || syncStatus === 'not_available') return 'offline';
@@ -1501,13 +1534,12 @@ async function workspacePage(appId, req) {
         overlayCopy.textContent = text;
       }
     }
-    async function sendTerminalInput(data) {
-      if (terminalStatus !== 'running') {
-        terminalError.textContent = 'Terminal is not running. Start or resume Codex before typing.';
-        terminalError.classList.add('visible');
-        return;
-      }
-      sendingInput = sendingInput.then(async () => {
+    async function flushTerminalInput() {
+      if (flushingInput || !inputBuffer) return;
+      flushingInput = true;
+      const data = inputBuffer;
+      inputBuffer = '';
+      try {
         const response = await fetch('/workspaces/${escapeHtml(app.id)}/terminal/input', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -1519,11 +1551,23 @@ async function workspacePage(appId, req) {
           terminalError.classList.add('visible');
           renderTerminalState('resumable');
         }
-      }).catch((error) => {
+      } catch (error) {
         terminalError.textContent = error.message || 'Terminal input failed.';
         terminalError.classList.add('visible');
-      });
-      return sendingInput;
+      } finally {
+        flushingInput = false;
+        if (inputBuffer) flushTerminalInput();
+      }
+    }
+    function sendTerminalInput(data) {
+      if (terminalStatus !== 'running') {
+        terminalError.textContent = 'Terminal is not running. Start or resume Codex before typing.';
+        terminalError.classList.add('visible');
+        return;
+      }
+      inputBuffer += data;
+      if (inputFlushTimer) clearTimeout(inputFlushTimer);
+      inputFlushTimer = setTimeout(flushTerminalInput, 20);
     }
     terminal.onData((data) => {
       sendTerminalInput(data);
@@ -1638,9 +1682,7 @@ function taskSse(req, res, taskId) {
     const task = store.data.tasks[taskId] || null;
     res.write(`data: ${JSON.stringify({ task, events: nextEvents })}\n\n`);
   };
-  send().catch((error) => {
-    res.write(`data: ${JSON.stringify({ error: error.message, events: [] })}\n\n`);
-  });
+  send();
   const interval = setInterval(send, 1500);
   req.on("close", () => clearInterval(interval));
 }
@@ -1653,21 +1695,29 @@ function workspaceSse(req, res, appId) {
   });
   const initialSession = store.getWorkspaceSession(appId);
   let lastIndex = initialSession.status === "running" ? (initialSession.visibleTranscriptStart || 0) : 0;
+  let gitStatusCache = null;
+  let gitStatusLastChecked = 0;
   const send = async () => {
     const session = store.getWorkspaceSession(appId);
     const transcript = session.transcript || [];
     const nextEvents = transcript.slice(lastIndex);
     lastIndex = transcript.length;
     const app = store.getApp(appId);
-    const gitStatus = app ? await localGitStatus(app) : null;
-    res.write(`data: ${JSON.stringify({ app: app ? { id: app.id, cloneStatus: app.cloneStatus, gitSync: app.gitSync, localPath: app.localPath } : null, session, localGitStatus: gitStatus, events: nextEvents })}\n\n`);
+    const now = Date.now();
+    if (app && now - gitStatusLastChecked > 2500) {
+      gitStatusCache = await localGitStatus(app);
+      gitStatusLastChecked = now;
+    }
+    res.write(`data: ${JSON.stringify({ app: app ? { id: app.id, cloneStatus: app.cloneStatus, gitSync: app.gitSync, localPath: app.localPath } : null, session, localGitStatus: gitStatusCache, events: nextEvents })}\n\n`);
   };
-  send();
+  send().catch((error) => {
+    res.write(`data: ${JSON.stringify({ error: error.message, events: [] })}\n\n`);
+  });
   const interval = setInterval(() => {
     send().catch((error) => {
       res.write(`data: ${JSON.stringify({ error: error.message, events: [] })}\n\n`);
     });
-  }, 1000);
+  }, 150);
   req.on("close", () => clearInterval(interval));
 }
 
