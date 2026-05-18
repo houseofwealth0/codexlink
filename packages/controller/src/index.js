@@ -769,10 +769,12 @@ function startInteractiveCodexForWorkspace(appId, options = {}) {
   const command = codexCommand();
   const resume = Boolean(options.resume);
   const args = resume ? codexResumeArgs(command, validation.path) : codexInteractiveArgs(command, validation.path);
+  const previousTranscriptLength = store.getWorkspaceSession(appId).transcript.length;
   store.updateWorkspaceSession(appId, {
     status: "running",
     mode: "interactive",
     lastStartMode: resume ? "resume" : "new",
+    visibleTranscriptStart: previousTranscriptLength,
     startedAt: new Date().toISOString(),
     stoppedAt: null
   });
@@ -815,6 +817,20 @@ function writeInteractiveCodexInput(appId, input) {
   if (!active || active.type !== "pty") return { ok: false, error: "No interactive Codex terminal is running." };
   active.process.write(input);
   return { ok: true };
+}
+
+async function localGitStatus(app) {
+  const validation = validateLocalPath(app.localPath);
+  if (!validation.ok) return { ok: false, dirty: false, message: validation.error, short: "" };
+  const result = await execFilePromise("git", gitArgs(validation.path, ["status", "--short"]), { cwd: validation.path });
+  if (!result.ok) return { ok: false, dirty: false, message: result.stderr || result.stdout || "Could not read local Git status.", short: "" };
+  const short = result.stdout.trim();
+  return {
+    ok: true,
+    dirty: Boolean(short),
+    message: short ? "Local changes ready to publish." : "No local changes waiting to publish.",
+    short
+  };
 }
 
 async function publishWorkspaceChanges(appId) {
@@ -1153,6 +1169,13 @@ async function workspacePage(appId, req) {
       ? "Codex will be enabled after GitHub Sync creates the local checkout automatically."
       : pathStatus.error;
   const canResumeCodex = pathStatus.ok && session.mode === "interactive" && (session.transcript || []).some((event) => event.type === "terminal");
+  const terminalStateText = session.status === "running"
+    ? "Live terminal connected. Click inside the terminal and type normally."
+    : session.status === "resumable"
+      ? "Previous terminal output is shown. Resume it before typing."
+      : "Terminal is stopped. Start a new terminal before typing.";
+  const gitStatus = await localGitStatus(app);
+  const pipelineRepo = gitSync.repoUrl || clone.remote || git.remote || "not connected yet";
 
   return `<!doctype html>
 <html>
@@ -1178,10 +1201,22 @@ async function workspacePage(appId, req) {
     .secondary { background: #475467; }
     .header-row, .controls { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
     .terminal-wrap { display: grid; grid-template-rows: minmax(420px, 66vh) auto; overflow: hidden; }
-    #terminal { overflow: hidden; background: #0d1117; border-radius: 8px; padding: 8px; }
+    .terminal-shell { position: relative; min-height: 420px; background: #0d1117; border-radius: 8px; overflow: hidden; }
+    #terminal { height: 100%; min-height: 420px; overflow: hidden; padding: 8px; }
     #terminal .xterm { height: 100%; }
+    .terminal-overlay { position: absolute; inset: 0; display: none; place-items: center; background: rgba(13,17,23,.78); color: #e6edf3; padding: 24px; text-align: center; z-index: 3; }
+    .terminal-overlay.visible { display: grid; }
+    .terminal-overlay-panel { max-width: 460px; display: grid; gap: 12px; justify-items: center; }
+    .terminal-state { margin-top: 10px; font-size: 13px; }
+    .terminal-error { display: none; color: #b42318; font-size: 13px; margin-top: 8px; }
+    .terminal-error.visible { display: block; }
     .terminal-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; margin-top: 12px; }
     .terminal-input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .fallback-toggle { border: 0; background: transparent; color: #1f6feb; padding: 0; font-weight: 600; }
+    .pipeline { display: grid; gap: 10px; }
+    .pipeline-step { border: 1px solid #dfe3ea; border-radius: 6px; padding: 10px; }
+    .pipeline-step strong { display: block; margin-bottom: 4px; }
+    .pipeline-status { border-color: #dbeafe; background: #eff6ff; }
     .prompt-form { display: grid; gap: 10px; margin-top: 12px; }
     .side { display: grid; gap: 14px; }
     .meta { display: grid; gap: 8px; font-size: 14px; }
@@ -1239,10 +1274,26 @@ async function workspacePage(appId, req) {
     <section>
       <h2>Live Codex Terminal</h2>
       <div class="terminal-wrap">
-        <div id="terminal"></div>
+        <div class="terminal-shell">
+          <div id="terminal"></div>
+          <div id="terminal-overlay" class="terminal-overlay ${session.status === "running" ? "" : "visible"}">
+            <div class="terminal-overlay-panel">
+              <strong id="terminal-overlay-title">${escapeHtml(session.status === "resumable" ? "Resume previous Codex terminal" : "Start a Codex terminal")}</strong>
+              <span id="terminal-overlay-copy">${escapeHtml(terminalStateText)}</span>
+              <div class="controls">
+                <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/terminal/resume">
+                  <button class="secondary" type="submit" ${canResumeCodex ? "" : "disabled"}>Resume Previous Terminal</button>
+                </form>
+                <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/terminal/start">
+                  <button type="submit" ${promptDisabled}>Start New Terminal</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
         <div>
           <div class="header-row">
-            <span class="muted">${escapeHtml(promptHint)}</span>
+            <span id="terminal-state" class="muted terminal-state">${escapeHtml(terminalStateText)}</span>
             <div class="controls">
               <form class="inline" method="post" action="/workspaces/${escapeHtml(app.id)}/terminal/start">
                 <button type="submit" ${promptDisabled}>Start New Terminal</button>
@@ -1252,7 +1303,9 @@ async function workspacePage(appId, req) {
               </form>
             </div>
           </div>
-          <form id="terminal-input-form" class="terminal-input-row">
+          <div id="terminal-error" class="terminal-error"></div>
+          <button id="fallback-toggle" class="fallback-toggle" type="button">Show fallback input</button>
+          <form id="terminal-input-form" class="terminal-input-row" hidden>
             <input id="terminal-input" class="terminal-input" ${promptDisabled} autocomplete="off" placeholder="Type to Codex, then press Enter" />
             <button type="submit" ${promptDisabled}>Send</button>
           </form>
@@ -1260,6 +1313,15 @@ async function workspacePage(appId, req) {
       </div>
     </section>
     <aside class="side">
+      <section>
+        <h2>Change Pipeline</h2>
+        <div class="pipeline">
+          <div class="pipeline-step pipeline-status"><strong>Local changes</strong><span id="local-git-message">${escapeHtml(gitStatus.message)}</span>${gitStatus.short ? `<pre id="local-git-short">${escapeHtml(gitStatus.short)}</pre>` : `<pre id="local-git-short" hidden></pre>`}</div>
+          <div class="pipeline-step"><strong>Codex edits</strong><span>Local controller checkout</span><br><code>${escapeHtml(pathStatus.ok ? pathStatus.path : "not ready yet")}</code></div>
+          <div class="pipeline-step"><strong>Publish pushes</strong><span>GitHub repository</span><br><code id="pipeline-repo">${escapeHtml(pipelineRepo)}</code></div>
+          <div class="pipeline-step"><strong>Replit updates</strong><span>Worker pulls from GitHub after publish.</span></div>
+        </div>
+      </section>
       ${reconnectNeeded && reconnectCommand ? `<section class="warning"><h2>Worker Reconnect Needed</h2><p>This workspace was installed with an older public tunnel URL. Run this once in that Replit workspace to update the existing worker without creating a duplicate app.</p><pre>${escapeHtml(reconnectCommand)}</pre></section>` : ""}
       ${pathStatus.ok ? "" : autoSyncAvailable ? `<section class="warning"><h2>GitHub Sync Needed</h2><p>This Replit workspace has internal Git. Codex Link will create a private GitHub remote, push the Replit project, and prepare the controller workspace automatically.</p></section>` : `<section class="warning"><h2>GitHub Remote Needed</h2><p>Codex Link needs a controller-ready Git remote before Codex can run against this project.</p></section>`}
       <section>
@@ -1322,6 +1384,12 @@ async function workspacePage(appId, req) {
   <script src="/assets/xterm.js"></script>
   <script>
     const terminalEl = document.getElementById('terminal');
+    const overlay = document.getElementById('terminal-overlay');
+    const overlayTitle = document.getElementById('terminal-overlay-title');
+    const overlayCopy = document.getElementById('terminal-overlay-copy');
+    const terminalState = document.getElementById('terminal-state');
+    const terminalError = document.getElementById('terminal-error');
+    const fallbackToggle = document.getElementById('fallback-toggle');
     const terminal = new Terminal({
       convertEol: true,
       cursorBlink: true,
@@ -1334,6 +1402,9 @@ async function workspacePage(appId, req) {
     const inputForm = document.getElementById('terminal-input-form');
     const input = document.getElementById('terminal-input');
     const initialGitBranch = ${JSON.stringify(git.branch || "not selected yet")};
+    let terminalStatus = ${JSON.stringify(session.status || "idle")};
+    let hasWrittenPreviousMarker = false;
+    let sendingInput = Promise.resolve();
     function syncClass(syncStatus) {
       if (syncStatus === 'ready' || syncStatus === 'github_login_started') return 'online';
       if (syncStatus === 'failed' || syncStatus === 'not_available') return 'offline';
@@ -1401,27 +1472,101 @@ async function workspacePage(appId, req) {
     function appendEvent(event) {
       const when = new Date(event.createdAt).toLocaleTimeString();
       if (event.type === 'terminal') {
+        if (terminalStatus !== 'running' && !hasWrittenPreviousMarker) {
+          terminal.writeln('\\x1b[38;5;245m--- previous session output ---\\x1b[0m');
+          hasWrittenPreviousMarker = true;
+        }
         terminal.write(event.text);
         return;
       }
       const prefix = '[' + when + '] ' + event.type + ': ';
       terminal.writeln(prefix + event.text.replace(/\\n$/, ''));
     }
+    function stateText(nextStatus) {
+      if (nextStatus === 'running') return 'Live terminal connected. Click inside the terminal and type normally.';
+      if (nextStatus === 'resumable') return 'Previous terminal output is shown. Resume it before typing.';
+      return 'Terminal is stopped. Start a new terminal before typing.';
+    }
+    function renderTerminalState(nextStatus) {
+      terminalStatus = nextStatus || 'idle';
+      const text = stateText(terminalStatus);
+      terminalState.textContent = text;
+      if (terminalStatus === 'running') {
+        overlay.classList.remove('visible');
+        terminalError.classList.remove('visible');
+        terminal.focus();
+      } else {
+        overlay.classList.add('visible');
+        overlayTitle.textContent = terminalStatus === 'resumable' ? 'Resume previous Codex terminal' : 'Start a Codex terminal';
+        overlayCopy.textContent = text;
+      }
+    }
+    async function sendTerminalInput(data) {
+      if (terminalStatus !== 'running') {
+        terminalError.textContent = 'Terminal is not running. Start or resume Codex before typing.';
+        terminalError.classList.add('visible');
+        return;
+      }
+      sendingInput = sendingInput.then(async () => {
+        const response = await fetch('/workspaces/${escapeHtml(app.id)}/terminal/input', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ input: data })
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          terminalError.textContent = payload.error || 'Terminal input failed.';
+          terminalError.classList.add('visible');
+          renderTerminalState('resumable');
+        }
+      }).catch((error) => {
+        terminalError.textContent = error.message || 'Terminal input failed.';
+        terminalError.classList.add('visible');
+      });
+      return sendingInput;
+    }
+    terminal.onData((data) => {
+      sendTerminalInput(data);
+    });
+    terminalEl.addEventListener('click', () => {
+      terminal.focus();
+      if (terminalStatus !== 'running') {
+        terminalError.textContent = 'Terminal is not running. Start or resume Codex before typing.';
+        terminalError.classList.add('visible');
+      }
+    });
+    fallbackToggle.addEventListener('click', () => {
+      inputForm.hidden = !inputForm.hidden;
+      fallbackToggle.textContent = inputForm.hidden ? 'Show fallback input' : 'Hide fallback input';
+      if (!inputForm.hidden) input.focus();
+    });
     inputForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       const value = input.value;
       if (!value.trim()) return;
       input.value = '';
-      await fetch('/workspaces/${escapeHtml(app.id)}/terminal/input', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ input: value + '\\r' })
-      });
+      await sendTerminalInput(value + '\\r');
     });
+    renderTerminalState(terminalStatus);
     const source = new EventSource('/workspaces/${escapeHtml(app.id)}/events');
     source.onmessage = (message) => {
       const payload = JSON.parse(message.data);
-      if (payload.session?.status) status.textContent = payload.session.status;
+      if (payload.session?.status) {
+        status.textContent = payload.session.status;
+        renderTerminalState(payload.session.status);
+      }
+      if (payload.localGitStatus) {
+        const localGitMessage = document.getElementById('local-git-message');
+        const localGitShort = document.getElementById('local-git-short');
+        localGitMessage.textContent = payload.localGitStatus.message || 'No local Git status yet.';
+        if (payload.localGitStatus.short) {
+          localGitShort.hidden = false;
+          localGitShort.textContent = payload.localGitStatus.short;
+        } else {
+          localGitShort.hidden = true;
+          localGitShort.textContent = '';
+        }
+      }
       if (payload.app?.cloneStatus) {
         const clone = payload.app.cloneStatus;
         const cloneStatus = document.getElementById('clone-status');
@@ -1493,7 +1638,9 @@ function taskSse(req, res, taskId) {
     const task = store.data.tasks[taskId] || null;
     res.write(`data: ${JSON.stringify({ task, events: nextEvents })}\n\n`);
   };
-  send();
+  send().catch((error) => {
+    res.write(`data: ${JSON.stringify({ error: error.message, events: [] })}\n\n`);
+  });
   const interval = setInterval(send, 1500);
   req.on("close", () => clearInterval(interval));
 }
@@ -1504,17 +1651,23 @@ function workspaceSse(req, res, appId) {
     "cache-control": "no-cache",
     connection: "keep-alive"
   });
-  let lastIndex = 0;
-  const send = () => {
+  const initialSession = store.getWorkspaceSession(appId);
+  let lastIndex = initialSession.status === "running" ? (initialSession.visibleTranscriptStart || 0) : 0;
+  const send = async () => {
     const session = store.getWorkspaceSession(appId);
     const transcript = session.transcript || [];
     const nextEvents = transcript.slice(lastIndex);
     lastIndex = transcript.length;
     const app = store.getApp(appId);
-    res.write(`data: ${JSON.stringify({ app: app ? { id: app.id, cloneStatus: app.cloneStatus, gitSync: app.gitSync, localPath: app.localPath } : null, session, events: nextEvents })}\n\n`);
+    const gitStatus = app ? await localGitStatus(app) : null;
+    res.write(`data: ${JSON.stringify({ app: app ? { id: app.id, cloneStatus: app.cloneStatus, gitSync: app.gitSync, localPath: app.localPath } : null, session, localGitStatus: gitStatus, events: nextEvents })}\n\n`);
   };
   send();
-  const interval = setInterval(send, 1000);
+  const interval = setInterval(() => {
+    send().catch((error) => {
+      res.write(`data: ${JSON.stringify({ error: error.message, events: [] })}\n\n`);
+    });
+  }, 1000);
   req.on("close", () => clearInterval(interval));
 }
 
